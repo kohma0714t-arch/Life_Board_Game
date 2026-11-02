@@ -5,6 +5,7 @@ import {
   CharacterId,
   THEME_COLOR_LIST,
   ThemeColorId,
+  TokenSkinId,
 } from '../config/constants';
 import {
   AssetBreakdown,
@@ -30,6 +31,7 @@ export interface LobbyPlayerSlot {
   isReady: boolean;
   characterId: CharacterId;
   colorId: ThemeColorId;
+  skinId?: TokenSkinId;
 }
 
 export interface RoomLobbyState {
@@ -110,6 +112,9 @@ type ClientToHostMessage =
       type: 'JOIN_REQUEST';
       sessionId: string;
       preferredName?: string;
+      preferredCharacterId?: CharacterId;
+      preferredColorId?: ThemeColorId;
+      preferredSkinId?: TokenSkinId;
     }
   | {
       type: 'CUSTOMIZE_PLAYER';
@@ -118,6 +123,7 @@ type ClientToHostMessage =
         name?: string;
         characterId?: CharacterId;
         colorId?: ThemeColorId;
+        skinId?: TokenSkinId;
       };
     }
   | {
@@ -181,6 +187,7 @@ export class RoomManager {
           isReady: true,
           characterId: 'char_1',
           colorId: 'blue',
+          skinId: 'standard',
         },
         {
           id: 'cpu_1',
@@ -191,6 +198,7 @@ export class RoomManager {
           isReady: true,
           characterId: 'char_2',
           colorId: 'green',
+          skinId: 'standard',
         },
         {
           id: 'cpu_2',
@@ -201,6 +209,7 @@ export class RoomManager {
           isReady: true,
           characterId: 'char_3',
           colorId: 'purple',
+          skinId: 'standard',
         },
       ],
     };
@@ -418,10 +427,14 @@ export class RoomManager {
           this.hostConnection = conn;
 
           conn.on('open', () => {
+            const localP = this.getLocalPlayer();
             const joinMsg: ClientToHostMessage = {
               type: 'JOIN_REQUEST',
               sessionId: this.localSessionId,
-              preferredName: this.getLocalPlayer()?.name,
+              preferredName: localP?.name,
+              preferredCharacterId: localP?.characterId,
+              preferredColorId: localP?.colorId,
+              preferredSkinId: localP?.skinId,
             };
             conn.send(joinMsg);
           });
@@ -512,7 +525,12 @@ export class RoomManager {
           this.setPlayerConnectionStatus(assignedPlayerId, true);
         } else {
           // 2. 新規ゲスト参加：CPU枠があれば1つを人間ゲスト枠に置き換え、なければ新規枠（最大6人）を追加
-          assignedPlayerId = this.allocateSlotForNewGuest(msg.preferredName);
+          assignedPlayerId = this.allocateSlotForNewGuest(
+            msg.preferredName,
+            msg.preferredCharacterId,
+            msg.preferredColorId,
+            msg.preferredSkinId
+          );
           this.sessionToPlayerId.set(msg.sessionId, assignedPlayerId);
           this.guestConnections.set(assignedPlayerId, conn);
         }
@@ -552,7 +570,12 @@ export class RoomManager {
     });
   }
 
-  private allocateSlotForNewGuest(preferredName?: string): string {
+  private allocateSlotForNewGuest(
+    preferredName?: string,
+    preferredCharacterId?: CharacterId,
+    preferredColorId?: ThemeColorId,
+    preferredSkinId?: TokenSkinId
+  ): string {
     const humanCount = this.lobbyState.players.filter((p) => !p.isCpu).length + 1;
     const guestId = `player_${humanCount}_${Math.random().toString(36).slice(2, 5)}`;
     const guestName =
@@ -573,8 +596,9 @@ export class RoomManager {
         isHost: false,
         isConnected: true,
         isReady: true,
-        characterId: cpuSlot.characterId,
-        colorId: cpuSlot.colorId,
+        characterId: preferredCharacterId ?? cpuSlot.characterId,
+        colorId: preferredColorId ?? cpuSlot.colorId,
+        skinId: preferredSkinId ?? cpuSlot.skinId ?? 'standard',
       };
       return guestId;
     }
@@ -583,10 +607,12 @@ export class RoomManager {
     if (this.lobbyState.players.length < 6) {
       const usedColors = new Set(this.lobbyState.players.map((p) => p.colorId));
       const availableColor =
+        preferredColorId ??
         THEME_COLOR_LIST.find((c) => !usedColors.has(c.id))?.id ??
         THEME_COLOR_LIST[this.lobbyState.players.length % THEME_COLOR_LIST.length].id;
-      const charDef =
-        CHARACTER_LIST[this.lobbyState.players.length % CHARACTER_LIST.length];
+      const charDefId =
+        preferredCharacterId ??
+        CHARACTER_LIST[this.lobbyState.players.length % CHARACTER_LIST.length].id;
 
       this.lobbyState.players.push({
         id: guestId,
@@ -595,8 +621,9 @@ export class RoomManager {
         isHost: false,
         isConnected: true,
         isReady: true,
-        characterId: charDef.id,
+        characterId: charDefId,
         colorId: availableColor,
+        skinId: preferredSkinId ?? 'standard',
       });
       return guestId;
     }
@@ -718,6 +745,7 @@ export class RoomManager {
         isHost: p.isHost,
         characterId: p.characterId,
         colorId: p.colorId,
+        skinId: p.skinId ?? 'standard',
       })),
       this.currentCallbacks
     );
@@ -892,6 +920,7 @@ export class RoomManager {
       name?: string;
       characterId?: CharacterId;
       colorId?: ThemeColorId;
+      skinId?: TokenSkinId;
     }
   ): void {
     // ゲストの場合はホストへ変更リクエストを送信
@@ -915,6 +944,9 @@ export class RoomManager {
     }
     if (updates.colorId !== undefined) {
       target.colorId = updates.colorId;
+    }
+    if (updates.skinId !== undefined) {
+      target.skinId = updates.skinId;
     }
 
     this.broadcastLobbySync();
@@ -1118,6 +1150,7 @@ export class RoomManager {
         isHost: p.isHost,
         characterId: p.characterId,
         colorId: p.colorId,
+        skinId: p.skinId ?? 'standard',
       })),
       wrappedCallbacks
     );

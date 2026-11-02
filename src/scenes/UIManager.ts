@@ -1,4 +1,9 @@
-import { characterAvatarUrls, cityPreviewUrl } from '../assets/asset-manifest';
+import {
+  characterAvatarUrls,
+  cityPreviewUrl,
+  propertyIllustrationUrls,
+  renderTokenShowcaseSvg,
+} from '../assets/asset-manifest';
 import { SoundManager } from '../audio/sound-manager';
 import {
   AUCTION_MIN_INCREMENT,
@@ -14,8 +19,11 @@ import {
   THEME_COLORS,
   THEME_COLOR_LIST,
   TIME_MODE_OPTIONS_MIN,
+  TOKEN_SKINS,
+  TOKEN_SKIN_LIST,
   TURN_MODE_OPTIONS,
   ThemeColorId,
+  TokenSkinId,
 } from '../config/constants';
 import { RoomLobbyState, RoomManager } from '../network/RoomManager';
 import {
@@ -35,9 +43,45 @@ import {
   calculateUpgradeCost,
   isGroupMonopolized,
 } from '../systems/MapGenerator';
+import { GameIcons } from '../ui/GameIcons';
+import { DevConsole } from '../ui/DevConsole';
+import {
+  MatchRewardSummary,
+  progressionManager,
+} from '../systems/ProgressionManager';
 import { MainScene } from './MainScene';
 
-export type ScreenType = 'TITLE' | 'LOBBY' | 'CHAR_SELECT' | 'GAME' | 'RESULT';
+export type ScreenType =
+  | 'TITLE'
+  | 'MODE_SELECT'
+  | 'LOADING'
+  | 'LOBBY'
+  | 'CHAR_SELECT'
+  | 'GAME'
+  | 'RESULT';
+
+const LOADING_TIPS: Array<{ title: string; body: string }> = [
+  {
+    title: '🏢 カラーグループ独占ボーナス',
+    body: '同じ色のエリアの物件をすべて買い占めると「独占」となり、通行料と定期収益がすべて1.5倍に跳ね上がります！',
+  },
+  {
+    title: '💼 職業スキルを活かそう',
+    body: '「不動産王」は物件購入費15%割引＆所有上限+2件、「医師」はマイナスマスの被害を30%軽減できます。',
+  },
+  {
+    title: '🔨 破産競売（オークション）は最大のチャンス',
+    body: '資金不足のプレイヤーが出ると所有物件が1万円スタートの公開競売にかけられます。格安で優良物件を手に入れましょう！',
+  },
+  {
+    title: '🎯 指定出目カード＆シールドの使いどころ',
+    body: 'サイコロを振る前に「アイテム使用」から指定出目カードを使えば、狙った物件マスや給料マスに確実に止まれます。',
+  },
+  {
+    title: '👨‍👩‍👧 家族を増やして人生イベントボーナス獲得',
+    body: '結婚や出産で家族が増えると生活費もかかりますが、人生イベントマスでの臨時ボーナスが大きくアップします！',
+  },
+];
 
 type SubOverlayModal =
   | 'NONE'
@@ -60,17 +104,27 @@ export class UIManager {
   private currentScreen: ScreenType = 'TITLE';
   private subModal: SubOverlayModal = 'NONE';
 
-  // キャラクター選択画面の対象プレイヤーID
+  // キャラクター選択画面の対象プレイヤーID＆戻り先画面
   private editingPlayerId: string = 'player_1';
   private selectedCharId: CharacterId = 'char_1';
   private selectedColorId: ThemeColorId = 'blue';
+  private selectedSkinId: TokenSkinId = 'standard';
   private editingPlayerName: string = 'プレイヤー1';
+  private charSelectReturnScreen: ScreenType = 'MODE_SELECT';
+  private charSelectTab: 'tokens' | 'skins' = 'tokens';
+  private charSelectNotice: string = '';
+  private isLoginModalOpen: boolean = false;
+  private loginModalReason: string = '';
+
+  // リザルト獲得ライフコイン内訳
+  private lastMatchReward: MatchRewardSummary | null = null;
 
   // サブモーダル用の一時状態
   private inspectedPlayerId: string | null = null;
   private inspectedTileId: number | null = null;
   private selectedDiceCardTarget: number = 6;
   private shopDiscardSlotIndex: number = 0;
+  private pendingSellTileId: number | null = null;
 
   // トレード作成フォーム状態
   private tradeTargetPlayerId: string = '';
@@ -92,7 +146,31 @@ export class UIManager {
   private lobbyJoinCodeInput: string = '';
   private lobbyNoticeMessage: string = '';
   private isJoinDrawerOpen: boolean = false;
-  private lobbyCountdownTargetMs: number = Date.now() + 83000; // 00:01:23 からカウントダウン開始
+
+  // ルーム作成・参加選択画面 (MODE_SELECT) 用状態
+  private modeSelectRoomTitleInput: string = 'たのしい人生ゲーム';
+  private modeSelectPlayerNameInput: string = 'プレイヤー1';
+  private modeSelectErrorMessage: string = '';
+  private isJoinRoomModalOpen: boolean = false;
+
+  // ロード画面 (LOADING) 用状態
+  private loadingTitle: string = '読み込み中...';
+  private loadingSubtext: string = 'しばらくお待ちください...';
+  private loadingProgress: number = 0;
+  private loadingTipIndex: number = 0;
+  private loadingTimerId: number | null = null;
+
+  // 物件購入ダイアログの最小化（マップ見渡し）状態
+  private isPropertyModalMinimized: boolean = false;
+
+  // 画面右下の行動ログパネル表示／非表示トグル状態
+  private isLogPanelVisible: boolean = true;
+
+  // 画面UIスケール（0.70〜1.30）
+  private uiScale: number = 1.0;
+
+  // 🛠️ 開発者コンソール
+  public devConsole: DevConsole;
 
   constructor(
     container: HTMLElement,
@@ -105,19 +183,78 @@ export class UIManager {
     this.soundManager = soundManager;
     this.mainScene = mainScene;
 
+    // 保存済みUIスケールの読み込み
+    try {
+      const savedScale = localStorage.getItem('lifeboard_ui_scale');
+      if (savedScale) {
+        const parsed = parseFloat(savedScale);
+        if (!isNaN(parsed) && parsed >= 0.7 && parsed <= 1.3) {
+          this.uiScale = Math.round(parsed * 100) / 100;
+        }
+      }
+    } catch {
+      // ignore
+    }
+    this.applyUiScale();
+    this.devConsole = new DevConsole(this.container, () => {
+      this.render();
+    });
+
     this.roomManager.setCallbacksForGuest(this.createEngineCallbacks());
     this.roomManager.setOnGuestMatchStart((guestEngine) => {
       this.engine = guestEngine;
-      this.mainScene.buildBoard(guestEngine.tiles);
-      this.mainScene.syncWithEngine(guestEngine);
-      this.currentScreen = 'GAME';
-      this.subModal = 'NONE';
-      this.soundManager.playGlobalSound('turn_start');
-      this.render();
+      this.devConsole.setEngine(guestEngine);
+      this.runWithLoadingScreen({
+        title: '🎲 ゲームを開始しています...',
+        steps: [
+          'ホストからマップデータを受信中...',
+          '3D都市ジオラマと物件を配置中...',
+          'プレイヤーコマと物理ダイスを準備中...',
+        ],
+        minDurationMs: 1100,
+        task: () => {
+          this.mainScene.buildBoard(guestEngine.tiles);
+          this.mainScene.syncWithEngine(guestEngine);
+          return true;
+        },
+        onComplete: () => {
+          this.currentScreen = 'GAME';
+          this.subModal = 'NONE';
+          this.soundManager.playGlobalSound('turn_start');
+          this.render();
+        },
+      });
     });
 
     this.roomManager.subscribe(() => {
       if (this.currentScreen === 'LOBBY' || this.currentScreen === 'CHAR_SELECT') {
+        this.render();
+      }
+    });
+
+    // 保存済みプロファイル（またはSupabaseクラウドプロファイル）をローカルプレイヤーへ反映
+    progressionManager.subscribe((prog) => {
+      const localP = this.roomManager.getLocalPlayer();
+      if (localP && this.roomManager.getLobbyState().p2pRole !== 'guest') {
+        if (
+          localP.characterId !== prog.selectedCharacterId ||
+          localP.colorId !== prog.selectedColorId ||
+          localP.skinId !== prog.selectedSkinId ||
+          (localP.name === 'プレイヤー1' && prog.displayName !== 'プレイヤー1')
+        ) {
+          this.roomManager.updatePlayerCustomization(localP.id, {
+            name: prog.displayName,
+            characterId: prog.selectedCharacterId,
+            colorId: prog.selectedColorId,
+            skinId: prog.selectedSkinId,
+          });
+        }
+      }
+      if (
+        this.currentScreen === 'TITLE' ||
+        this.currentScreen === 'MODE_SELECT' ||
+        this.currentScreen === 'CHAR_SELECT'
+      ) {
         this.render();
       }
     });
@@ -132,32 +269,102 @@ export class UIManager {
       }
     });
 
-    // URLに ?room=XXXXXX がある場合は自動的にロビー画面へ遷移してそのルームに参加する
+    this.mainScene.onCameraModeChange(() => {
+      if (this.currentScreen === 'GAME') {
+        this.updateCameraHud();
+      }
+    });
+
+    // URLに ?room=XXXXXX がある場合はロード画面を経由して招待ルームに接続する
     const inviteRoomCode = RoomManager.getInviteRoomIdFromUrl();
     if (inviteRoomCode) {
-      this.currentScreen = 'LOBBY';
       this.lobbyJoinCodeInput = inviteRoomCode;
-      this.lobbyNoticeMessage = `⏳ 招待ルーム (${inviteRoomCode}) に接続しています...`;
-      this.render();
-      void this.roomManager.joinP2PRoomByCode(inviteRoomCode).then((res) => {
-        this.lobbyNoticeMessage = res.ok
-          ? `✅ ルーム ${inviteRoomCode} に参加しました！「キャラ変更」から名前や見た目を設定できます。`
-          : `⚠️ ${res.error ?? 'ルーム接続に失敗しました'}`;
-        this.render();
+      this.runWithLoadingScreen({
+        title: `🔑 招待ルーム (${inviteRoomCode}) に接続中...`,
+        steps: [
+          'P2Pシグナリングサーバーへ接続しています...',
+          `ルームID「${inviteRoomCode}」のホストを検索中...`,
+          'プレイヤー情報を同期しています...',
+        ],
+        minDurationMs: 1100,
+        task: async () => {
+          const res = await this.roomManager.joinP2PRoomByCode(inviteRoomCode);
+          if (!res.ok) {
+            this.modeSelectErrorMessage = res.error ?? '招待ルームへの接続に失敗しました。';
+            return false;
+          }
+          this.lobbyNoticeMessage = `✅ ルーム ${inviteRoomCode} に参加しました！プレイヤー枠をクリックして名前や見た目を設定できます。`;
+          return true;
+        },
+        onComplete: () => {
+          this.showScreen('LOBBY');
+        },
+        onCancelOrFail: () => {
+          this.showScreen('MODE_SELECT');
+        },
       });
     } else {
+      // Google OAuth リダイレクトから戻ってきた場合は、元の画面（CHAR_SELECT / MODE_SELECT / TITLE）を維持する
+      try {
+        const oauthReturn = window.sessionStorage.getItem('lifeboard_oauth_return_screen');
+        const oauthTab = window.sessionStorage.getItem('lifeboard_oauth_return_tab');
+        if (oauthReturn) {
+          window.sessionStorage.removeItem('lifeboard_oauth_return_screen');
+          window.sessionStorage.removeItem('lifeboard_oauth_return_tab');
+          if (oauthReturn === 'CHAR_SELECT') {
+            const localP = this.roomManager.getLocalPlayer();
+            const prog = progressionManager.getState();
+            this.editingPlayerId = localP.id;
+            this.selectedCharId = localP.characterId;
+            this.selectedColorId = localP.colorId;
+            this.selectedSkinId = localP.skinId ?? prog.selectedSkinId ?? 'standard';
+            this.editingPlayerName = localP.name;
+            this.charSelectTab = oauthTab === 'skins' ? 'skins' : 'tokens';
+            this.charSelectNotice = '✅ Googleアカウントでログインしました！特別スキンと報酬コマを解放できます。';
+            this.currentScreen = 'CHAR_SELECT';
+          } else if (oauthReturn === 'MODE_SELECT' || oauthReturn === 'TITLE') {
+            this.currentScreen = oauthReturn;
+          }
+        }
+      } catch {
+        // ignore sessionStorage error
+      }
       this.render();
     }
+
+    // ESCキー押下時のポーズメニュー表示 / サブモーダルクローズ
+    window.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') {
+        if (this.currentScreen === 'GAME') {
+          if (this.subModal === 'PAUSE_MENU') {
+            this.soundManager.playGlobalSound('ui_cancel');
+            this.subModal = 'NONE';
+            this.render();
+          } else if (this.subModal === 'SETTINGS' || this.subModal === 'HELP' || this.subModal === 'PLAYER_DETAIL' || this.subModal === 'TILE_DETAIL') {
+            this.soundManager.playGlobalSound('ui_cancel');
+            this.subModal = 'PAUSE_MENU';
+            this.render();
+          } else if (this.subModal === 'NONE') {
+            this.soundManager.playGlobalSound('ui_click');
+            this.subModal = 'PAUSE_MENU';
+            this.render();
+          }
+        } else if (this.currentScreen === 'CHAR_SELECT') {
+          if (this.isLoginModalOpen) {
+            this.isLoginModalOpen = false;
+            this.render();
+          }
+        }
+      }
+    });
   }
 
   public setGameEngine(engine: GameEngine): void {
     this.engine = engine;
+    this.devConsole.setEngine(engine);
   }
 
   public showScreen(screen: ScreenType): void {
-    if (screen === 'LOBBY' && this.currentScreen !== 'LOBBY' && this.currentScreen !== 'CHAR_SELECT') {
-      this.lobbyCountdownTargetMs = Date.now() + 83000;
-    }
     this.currentScreen = screen;
     this.subModal = 'NONE';
     this.render();
@@ -181,33 +388,34 @@ export class UIManager {
     this.finalRankings = rankings;
     this.finalAwards = awards;
     this.selectedResultPlayerId = rankings[0]?.playerId ?? '';
+
+    // ローカルプレイヤーの試合結果からライフコイン報酬を算出・付与
+    const localP = this.roomManager.getLocalPlayer();
+    const myRanking =
+      rankings.find((r) => r.playerId === localP.id) ?? rankings[0];
+    if (myRanking) {
+      const myAwardsCount = awards.filter(
+        (a) => a.winnerPlayerId === myRanking.playerId
+      ).length;
+      this.lastMatchReward = progressionManager.awardMatchCoins(
+        myRanking.rank,
+        myRanking.totalNetWorth,
+        myAwardsCount
+      );
+    } else {
+      this.lastMatchReward = null;
+    }
+
     this.currentScreen = 'RESULT';
     this.subModal = 'NONE';
     this.soundManager.playGlobalSound('victory');
     this.render();
   }
 
-  private formatLobbyCountdown(): string {
-    const remainSec = Math.max(0, Math.ceil((this.lobbyCountdownTargetMs - Date.now()) / 1000));
-    const hrs = Math.floor(remainSec / 3600);
-    const mins = Math.floor((remainSec % 3600) / 60);
-    const secs = remainSec % 60;
-    const pad = (n: number) => String(n).padStart(2, '0');
-    return `${pad(hrs)}:${pad(mins)}:${pad(secs)}`;
-  }
-
   /**
    * 毎フレームの軽量タイマー表示更新（DOM全体を再構築せず秒数テキストのみ高速更新）
    */
   public updateTimersOnly(): void {
-    if (this.currentScreen === 'LOBBY') {
-      const lobbyCountdownEl = this.container.querySelector('#lobby-start-countdown');
-      if (lobbyCountdownEl) {
-        lobbyCountdownEl.textContent = this.formatLobbyCountdown();
-      }
-      return;
-    }
-
     if (this.currentScreen !== 'GAME' || !this.engine) return;
 
     const timerTextEl = this.container.querySelector('#hud-turn-timer-text');
@@ -245,6 +453,12 @@ export class UIManager {
       case 'TITLE':
         this.renderTitleScreen();
         break;
+      case 'MODE_SELECT':
+        this.renderModeSelectScreen();
+        break;
+      case 'LOADING':
+        this.renderLoadingScreen();
+        break;
       case 'LOBBY':
         this.renderLobbyScreen();
         break;
@@ -258,45 +472,402 @@ export class UIManager {
         this.renderResultScreen();
         break;
     }
+
+    if (this.devConsole?.getIsOpen()) {
+      this.devConsole.render();
+    }
+  }
+
+  /**
+   * ロード画面 (LOADING) を挟んで非同期処理または初期化処理を実行するヘルパー
+   */
+  private runWithLoadingScreen(options: {
+    title: string;
+    steps: string[];
+    minDurationMs?: number;
+    task: () => Promise<boolean> | boolean;
+    onComplete: () => void;
+    onCancelOrFail?: () => void;
+  }): void {
+    if (this.loadingTimerId !== null) {
+      window.clearInterval(this.loadingTimerId);
+      this.loadingTimerId = null;
+    }
+
+    this.loadingTitle = options.title;
+    this.loadingSubtext = options.steps[0] ?? '準備しています...';
+    this.loadingProgress = 12;
+    this.loadingTipIndex = Math.floor(Math.random() * LOADING_TIPS.length);
+    this.currentScreen = 'LOADING';
+    this.subModal = 'NONE';
+    this.render();
+
+    const startTime = Date.now();
+    const minMs = options.minDurationMs ?? 1100;
+    let stepIdx = 0;
+
+    this.loadingTimerId = window.setInterval(() => {
+      if (this.currentScreen !== 'LOADING') return;
+      this.loadingProgress = Math.min(92, this.loadingProgress + Math.floor(Math.random() * 11) + 6);
+      stepIdx = Math.min(
+        options.steps.length - 1,
+        Math.floor((this.loadingProgress / 95) * options.steps.length)
+      );
+      this.loadingSubtext = options.steps[stepIdx] ?? this.loadingSubtext;
+
+      const fillEl = this.container.querySelector('#loading-progress-fill') as HTMLElement | null;
+      const pctEl = this.container.querySelector('#loading-progress-pct');
+      const subEl = this.container.querySelector('#loading-subtext');
+      if (fillEl) fillEl.style.width = `${this.loadingProgress}%`;
+      if (pctEl) pctEl.textContent = `${this.loadingProgress}%`;
+      if (subEl) subEl.textContent = this.loadingSubtext;
+    }, 220);
+
+    void Promise.resolve(options.task()).then((ok) => {
+      const elapsed = Date.now() - startTime;
+      const remainWait = Math.max(120, minMs - elapsed);
+
+      window.setTimeout(() => {
+        if (this.loadingTimerId !== null) {
+          window.clearInterval(this.loadingTimerId);
+          this.loadingTimerId = null;
+        }
+        this.loadingProgress = 100;
+        const fillEl = this.container.querySelector('#loading-progress-fill') as HTMLElement | null;
+        const pctEl = this.container.querySelector('#loading-progress-pct');
+        if (fillEl) fillEl.style.width = '100%';
+        if (pctEl) pctEl.textContent = '100%';
+
+        window.setTimeout(() => {
+          if (ok) {
+            options.onComplete();
+          } else {
+            options.onCancelOrFail?.();
+          }
+        }, 180);
+      }, remainWait);
+    });
+  }
+
+  /**
+   * タイトル＆ルーム選択画面共通の立体3Dダイス＋軌道リング付き『Life Board』ヒーローロゴ
+   */
+  private renderHeroLogoBlock(subtitle = '〜 人生をかけた、最高のすごろく 〜'): string {
+    return `
+      <div class="hero-logo-block">
+        <div class="hero-orbit-wrap">
+          <svg class="hero-orbit-svg" viewBox="0 0 560 190" fill="none" aria-hidden="true">
+            <!-- 背面の軌道アーク -->
+            <path
+              d="M 55 128 C 110 62, 395 16, 495 54"
+              stroke="url(#orbitGrad)"
+              stroke-width="14"
+              stroke-linecap="round"
+            />
+            <!-- 右上のキラリ光線2本 -->
+            <polygon points="512,24 526,10 534,18 518,34" fill="#fbbf24" />
+            <polygon points="528,44 552,36 555,46 530,52" fill="#fbbf24" />
+            <defs>
+              <linearGradient id="orbitGrad" x1="50" y1="140" x2="500" y2="40" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#f59e0b" />
+                <stop offset="55%" stop-color="#fbbf24" />
+                <stop offset="100%" stop-color="#fde047" />
+              </linearGradient>
+            </defs>
+          </svg>
+
+          <!-- 3Dアイソメトリックサイコロ (上面4・左面3・右面5) -->
+          <div class="hero-3d-dice-icon" aria-hidden="true">
+            <svg viewBox="0 0 120 120" width="88" height="88">
+              <!-- ドロップシャドウ -->
+              <ellipse cx="60" cy="108" rx="34" ry="8" fill="rgba(15, 23, 42, 0.22)" />
+              <!-- 上面 (白) -->
+              <polygon points="60,12 104,34 60,56 16,34" fill="#ffffff" stroke="#172554" stroke-width="5" stroke-linejoin="round" />
+              <!-- 左面 (淡いブルーグレー) -->
+              <polygon points="16,34 60,56 60,104 16,80" fill="#f1f5f9" stroke="#172554" stroke-width="5" stroke-linejoin="round" />
+              <!-- 右面 (やや濃いブルーグレー陰影) -->
+              <polygon points="60,56 104,34 104,80 60,104" fill="#cbd5e1" stroke="#172554" stroke-width="5" stroke-linejoin="round" />
+              <!-- 上面：4の目 -->
+              <ellipse cx="44" cy="34" rx="4.6" ry="3.2" fill="#172554" />
+              <ellipse cx="76" cy="34" rx="4.6" ry="3.2" fill="#172554" />
+              <ellipse cx="60" cy="24" rx="4.6" ry="3.2" fill="#172554" />
+              <ellipse cx="60" cy="44" rx="4.6" ry="3.2" fill="#172554" />
+              <!-- 左面：3の目 -->
+              <ellipse cx="28" cy="50" rx="3.8" ry="4.8" transform="rotate(-20 28 50)" fill="#172554" />
+              <ellipse cx="38" cy="68" rx="3.8" ry="4.8" transform="rotate(-20 38 68)" fill="#172554" />
+              <ellipse cx="48" cy="86" rx="3.8" ry="4.8" transform="rotate(-20 48 86)" fill="#172554" />
+              <!-- 右面：5の目 -->
+              <ellipse cx="72" cy="54" rx="3.8" ry="4.8" transform="rotate(20 72 54)" fill="#172554" />
+              <ellipse cx="92" cy="44" rx="3.8" ry="4.8" transform="rotate(20 92 44)" fill="#172554" />
+              <ellipse cx="82" cy="68" rx="3.8" ry="4.8" transform="rotate(20 82 68)" fill="#172554" />
+              <ellipse cx="72" cy="84" rx="3.8" ry="4.8" transform="rotate(20 72 84)" fill="#172554" />
+              <ellipse cx="92" cy="74" rx="3.8" ry="4.8" transform="rotate(20 92 74)" fill="#172554" />
+            </svg>
+          </div>
+
+          <!-- ロゴ文字 -->
+          <h1 class="hero-logo-title" data-text="Life Board">Life Board</h1>
+
+          <!-- 前面の軌道アーク下部 -->
+          <svg class="hero-orbit-front-svg" viewBox="0 0 560 90" fill="none" aria-hidden="true">
+            <path
+              d="M 48 22 C 25 62, 165 78, 355 36"
+              stroke="url(#orbitFrontGrad)"
+              stroke-width="14"
+              stroke-linecap="round"
+            />
+            <defs>
+              <linearGradient id="orbitFrontGrad" x1="40" y1="30" x2="360" y2="40" gradientUnits="userSpaceOnUse">
+                <stop offset="0%" stop-color="#f59e0b" />
+                <stop offset="60%" stop-color="#fbbf24" />
+                <stop offset="100%" stop-color="#fde047" stop-opacity="0.15" />
+              </linearGradient>
+            </defs>
+          </svg>
+        </div>
+        <p class="hero-logo-subtitle">${this.escapeHtml(subtitle)}</p>
+      </div>
+    `;
+  }
+
+  /**
+   * ホーム画面（TITLE / MODE_SELECT）左上に表示されるログイン／アカウント状態ピルボタン
+   */
+  private renderHomeTopAuthPill(): string {
+    const prog = progressionManager.getState();
+    if (prog.isLoggedIn) {
+      return `
+        <button id="btn-home-top-auth" class="hero-auth-top-pill logged-in toy-btn toy-btn-white" title="クリックでログアウト確認">
+          <span class="auth-dot" style="display:inline-flex;align-items:center;">${GameIcons.check({ size: 16 })}</span>
+          <span>${this.escapeHtml(prog.email || 'Google連携済')}</span>
+          <span class="auth-coin-tag" style="display:inline-flex;align-items:center;gap:4px;">
+            ${GameIcons.coin({ size: 16 })} <span>${prog.lifeCoins.toLocaleString()}</span>
+          </span>
+        </button>
+      `;
+    }
+    return `
+      <button id="btn-home-top-auth" class="hero-auth-top-pill guest toy-btn toy-btn-white" title="Googleアカウントでログインしてスキンやコインを保存">
+        <span style="display:inline-flex;align-items:center;gap:6px;">
+          ${GameIcons.lock({ size: 18 })}
+          <span>ログイン / アカウント連携</span>
+        </span>
+      </button>
+    `;
+  }
+
+  /**
+   * 全画面共通：中央揃えのGoogleログイン案内モーダル
+   */
+  private renderLoginModal(): string {
+    if (!this.isLoginModalOpen) return '';
+    return `
+      <div class="modal-backdrop">
+        <div class="modal-card login-required-modal-card toy-panel-slab">
+          <div class="modal-header centered-header">
+            <h3 style="display:flex;align-items:center;justify-content:center;gap:8px;">
+              ${GameIcons.lock({ size: 28 })}
+              <span>スキン・報酬コマの解放にはログインが必要です</span>
+            </h3>
+          </div>
+          <div class="modal-body login-modal-body-centered">
+            <p class="modal-lead login-modal-lead-centered">
+              ${this.escapeHtml(
+                this.loginModalReason ||
+                  '特別スキンおよび報酬コマを解放する際は、データ保護のためGoogleアカウントでのログインが必須となります。'
+              )}
+            </p>
+            <div class="login-benefit-box centered-benefits">
+              <div class="benefit-item" style="display:flex;align-items:center;gap:8px;">
+                ${GameIcons.check({ size: 20 })}
+                <span>解放した<strong>特別マテリアルスキン・報酬コマ</strong>をクラウド保存</span>
+              </div>
+              <div class="benefit-item" style="display:flex;align-items:center;gap:8px;">
+                ${GameIcons.coin({ size: 20 })}
+                <span>試合で貯めた <strong>ライフコイン</strong> を別端末でも引き継ぎ</span>
+              </div>
+              <div class="benefit-item" style="display:flex;align-items:center;gap:8px;">
+                ${GameIcons.pawn({ size: 20 })}
+                <span>初期4種のコマと5色のカラーはログインなしでも遊べます</span>
+              </div>
+            </div>
+            <div class="login-modal-footer-btns">
+              <button id="btn-close-login-modal" class="toy-btn toy-btn-white" style="padding: 10px 24px; font-size: 0.95rem;">キャンセル</button>
+              <button id="btn-google-login-exec" class="toy-btn toy-btn-blue" style="padding: 12px 28px; font-size: 1.05rem;">
+                <span style="display:inline-flex;align-items:center;gap:8px;">
+                  ${GameIcons.google({ size: 20 })}
+                  <span>Googleでログインして連携</span>
+                </span>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private bindLoginModalEvents(): void {
+    const openLogin = (reason: string) => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.loginModalReason = reason;
+      this.isLoginModalOpen = true;
+      this.render();
+    };
+
+    const handleAuthPillClick = () => {
+      const prog = progressionManager.getState();
+      if (prog.isLoggedIn) {
+        this.soundManager.playGlobalSound('ui_click');
+        if (window.confirm(`現在「${prog.email || 'Google連携アカウント'}」でログイン中です。\nログアウトしますか？`)) {
+          void progressionManager.signOut().then(() => {
+            this.selectedSkinId = 'standard';
+            if (!CHARACTERS[this.selectedCharId]?.isInitialUnlocked) {
+              this.selectedCharId = 'char_1';
+            }
+            this.charSelectNotice = 'ログアウトしました。';
+            this.render();
+          });
+        }
+      } else {
+        openLogin(
+          'Googleアカウントでログインすると、特別マテリアルスキンや報酬コマの解放・ライフコインのクラウド保存が有効になります。'
+        );
+      }
+    };
+
+    this.container.querySelector('#btn-home-top-auth')?.addEventListener('click', handleAuthPillClick);
+    this.container.querySelector('#btn-title-login')?.addEventListener('click', handleAuthPillClick);
+
+    this.container.querySelector('#btn-close-login-modal')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_cancel');
+      this.isLoginModalOpen = false;
+      this.render();
+    });
+
+    this.container.querySelector('#btn-google-login-exec')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('event_good');
+      try {
+        window.sessionStorage.setItem('lifeboard_oauth_return_screen', this.currentScreen);
+        window.sessionStorage.setItem('lifeboard_oauth_return_tab', this.charSelectTab);
+      } catch {
+        // ignore
+      }
+      void progressionManager.signInWithGoogle().then((res) => {
+        this.isLoginModalOpen = false;
+        if (res.ok) {
+          this.charSelectNotice = res.message;
+        } else {
+          this.charSelectNotice = `⚠️ ${res.message}`;
+        }
+        this.render();
+      });
+    });
+  }
+
+  /**
+   * ホーム画面（TITLE / MODE_SELECT）右下に常時表示される「選択中キャラクター（立体コマ＆スキン）」ウィジェット
+   * クリックすると別画面のキャラクター＆スキン選択画面 (CHAR_SELECT) へ遷移する
+   */
+  private renderHomeSelectedCharWidget(): string {
+    const localP = this.roomManager.getLocalPlayer();
+    const prog = progressionManager.getState();
+    const charDef = CHARACTERS[localP.characterId] ?? CHARACTERS.char_1;
+    const colorDef = THEME_COLORS[localP.colorId] ?? THEME_COLORS.blue;
+    const skinId = localP.skinId ?? prog.selectedSkinId ?? 'standard';
+    const skinDef = TOKEN_SKINS[skinId] ?? TOKEN_SKINS.standard;
+    const tokenSvg = renderTokenShowcaseSvg(
+      localP.characterId,
+      colorDef.hex,
+      skinId,
+      118
+    );
+
+    return `
+      <button
+        id="btn-home-char-showcase"
+        class="home-char-showcase toy-panel-slab"
+        style="--char-theme: ${colorDef.hex}; --char-light: ${colorDef.lightHex}"
+        title="クリックしてコマ・カラー・特別スキン・名前を変更"
+      >
+        <div class="home-char-top-badges">
+          <div class="home-char-change-bubble" style="display:inline-flex;align-items:center;gap:6px;">
+            <span class="bubble-icon" style="display:inline-flex;align-items:center;">${GameIcons.pawn({ size: 16 })}</span>
+            <span>コマ＆スキン選択</span>
+          </div>
+          <div class="home-char-coin-pill" title="所持ライフコイン" style="display:inline-flex;align-items:center;gap:4px;">
+            <span style="display:inline-flex;align-items:center;">${GameIcons.coin({ size: 16 })}</span>
+            <span>${prog.lifeCoins.toLocaleString()}</span>
+          </div>
+        </div>
+
+        <div class="home-char-figure-wrap">
+          <div class="home-char-svg-stage">${tokenSvg}</div>
+        </div>
+
+        <div class="home-char-info-pill">
+          <span class="home-char-color-dot" style="background: ${colorDef.hex}"></span>
+          <div class="home-char-text-col">
+            <span class="home-char-player-name">${this.escapeHtml(localP.name)}</span>
+            <span class="home-char-sub-name">${charDef.name} ・ ${skinDef.name}</span>
+          </div>
+          <span class="home-char-arrow">❯</span>
+        </div>
+      </button>
+    `;
+  }
+
+  private bindHomeSelectedCharWidgetEvents(): void {
+    this.container.querySelector('#btn-home-char-showcase')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      const localP = this.roomManager.getLocalPlayer();
+      const prog = progressionManager.getState();
+      this.editingPlayerId = localP.id;
+      this.selectedCharId = localP.characterId;
+      this.selectedColorId = localP.colorId;
+      this.selectedSkinId = localP.skinId ?? prog.selectedSkinId ?? 'standard';
+      this.editingPlayerName = localP.name;
+      this.charSelectNotice = '';
+      this.isLoginModalOpen = false;
+      this.charSelectReturnScreen = this.currentScreen;
+      this.showScreen('CHAR_SELECT');
+    });
   }
 
   // ==========================================
-  // 1. タイトル画面 (TITLE) - リファレンス左上パネル完全準拠
+  // 1. タイトル画面 (TITLE)
   // ==========================================
   private renderTitleScreen(): void {
     this.container.innerHTML = `
-      <div class="screen-overlay title-screen">
-        <div class="sky-clouds-bg"></div>
-        <div class="city-silhouette-bg"></div>
+      <div class="screen-overlay hero-open-screen title-screen">
+        <div class="hero-ver-pill">Ver. 1.0.0</div>
 
-        <div class="title-center-card">
-          <div class="logo-wrapper">
-            <div class="logo-orbit-ring"></div>
-            <div class="logo-dice-badge" aria-hidden="true">
-              ${this.renderDiceSvgIcon(6, 68)}
-            </div>
-            <h1 class="logo-title-text">Life Board</h1>
-            <p class="logo-subtitle-text">3D オンライン人生＆不動産ボードゲーム</p>
-          </div>
+        <div class="hero-center-content">
+          ${this.renderHeroLogoBlock('〜 人生をかけた、最高のすごろく 〜')}
 
           <div class="title-actions">
-            <button id="btn-title-start" class="btn-primary-gradient btn-xl">
-              <span>ゲームスタート</span>
-              <span class="btn-arrow">❯</span>
+            <button id="btn-title-start" class="hero-menu-btn toy-btn toy-btn-gold" style="width: min(390px, 88vw); height: 68px; font-size: 1.55rem; letter-spacing: 0.04em;">
+              <span style="display:inline-flex;align-items:center;gap:12px;">
+                ${GameIcons.dice({ size: 34 })}
+                <span>ゲームスタート</span>
+              </span>
+              <span class="btn-arrow" style="font-size: 1.4rem; margin-left: 6px;">❯</span>
             </button>
 
             <div class="title-sub-buttons">
-              <button id="btn-title-settings" class="btn-white-pill">
-                <span class="icon">⚙️</span>
+              <button id="btn-title-settings" class="toy-btn toy-btn-white" style="padding: 10px 24px; font-size: 0.95rem;">
+                <span class="icon">${GameIcons.gear({ size: 18 })}</span>
                 <span>設定</span>
               </button>
-              <button id="btn-title-help" class="btn-white-pill">
-                <span class="icon">❓</span>
+              <button id="btn-title-help" class="toy-btn toy-btn-white" style="padding: 10px 24px; font-size: 0.95rem;">
+                <span class="icon" style="font-weight:900;font-size:1.1rem;color:#2563eb;">？</span>
                 <span>ヘルプ</span>
               </button>
             </div>
           </div>
         </div>
+
+        <!-- 右下：選択中キャラクター表示ウィジェット（クリックでキャラ選択画面へ） -->
+        ${this.renderHomeSelectedCharWidget()}
 
         ${this.renderSubOverlayModal()}
       </div>
@@ -305,10 +876,9 @@ export class UIManager {
     this.container.querySelector('#btn-title-start')?.addEventListener('click', () => {
       this.soundManager.playGlobalSound('ui_click');
       this.soundManager.startBGM();
-      this.showScreen('LOBBY');
-      if (this.roomManager.getLobbyState().p2pRole === 'offline') {
-        void this.roomManager.openP2PHostRoom();
-      }
+      this.modeSelectErrorMessage = '';
+      this.isJoinRoomModalOpen = false;
+      this.showScreen('MODE_SELECT');
     });
 
     this.container.querySelector('#btn-title-settings')?.addEventListener('click', () => {
@@ -323,7 +893,244 @@ export class UIManager {
       this.render();
     });
 
+    this.bindHomeSelectedCharWidgetEvents();
     this.bindSubOverlayEvents();
+  }
+
+  // ==========================================
+  // 1.5 ルーム作成／ルーム参加 選択画面 (MODE_SELECT) - 添付画像完全準拠
+  // ==========================================
+  private renderModeSelectScreen(): void {
+    const prog = progressionManager.getState();
+    this.container.innerHTML = `
+      <div class="screen-overlay hero-open-screen mode-select-screen">
+        <!-- 右上 Ver. 1.0.0 ピルバッジ -->
+        <div class="hero-ver-pill">Ver. 1.0.0</div>
+
+        <div class="hero-center-content">
+          <!-- 中央ロゴ＆サブタイトル -->
+          ${this.renderHeroLogoBlock('〜 人生をかけた、最高のすごろく 〜')}
+
+          <!-- 縦ピルボタンスタック -->
+          <div class="hero-menu-stack">
+            <!-- 1段目：＋ ルーム作成 (ブルー立体ピルボタン) -->
+            <button id="btn-mode-create-room" class="hero-menu-btn toy-btn toy-btn-blue" style="font-size: 1.35rem;">
+              <span class="hero-btn-icon" aria-hidden="true" style="display:inline-flex;align-items:center;">
+                ${GameIcons.plus({ size: 28 })}
+              </span>
+              <span class="hero-btn-label">ルーム作成</span>
+            </button>
+
+            <!-- 2段目：👥 ルーム参加 (ホワイト立体ピルボタン) -->
+            <button id="btn-mode-open-join" class="hero-menu-btn toy-btn toy-btn-white" style="font-size: 1.35rem;">
+              <span class="hero-btn-icon" aria-hidden="true" style="display:inline-flex;align-items:center;">
+                ${GameIcons.users({ size: 28 })}
+              </span>
+              <span class="hero-btn-label">ルーム参加</span>
+            </button>
+
+            <!-- 3段目：⚙️ 設定 (ホワイト立体ピルボタン) -->
+            <button id="btn-mode-settings" class="hero-menu-btn toy-btn toy-btn-white" style="font-size: 1.25rem;">
+              <span class="hero-btn-icon" aria-hidden="true" style="display:inline-flex;align-items:center;">
+                ${GameIcons.gear({ size: 26 })}
+              </span>
+              <span class="hero-btn-label">設定</span>
+            </button>
+
+            <!-- 4段目：🔐 ログイン / アカウント連携 (ホワイト立体ピルボタン) -->
+            <button id="btn-title-login" class="hero-menu-btn toy-btn toy-btn-white" style="font-size: 1.2rem;">
+              <span class="hero-btn-icon" aria-hidden="true" style="display:inline-flex;align-items:center;">
+                ${prog.isLoggedIn ? GameIcons.check({ size: 24 }) : GameIcons.lock({ size: 24 })}
+              </span>
+              <span class="hero-btn-label">${prog.isLoggedIn ? 'アカウント連携済' : 'ログイン'}</span>
+            </button>
+          </div>
+        </div>
+
+        <!-- 右下：選択中キャラクター表示ウィジェット（クリックでキャラ選択画面へ） -->
+        ${this.renderHomeSelectedCharWidget()}
+
+        ${this.renderLoginModal()}
+
+        <!-- ルーム参加（ID入力）モーダル -->
+        ${
+          this.isJoinRoomModalOpen
+            ? `
+          <div class="modal-backdrop">
+            <div class="modal-card join-room-modal-card">
+              <div class="modal-header">
+                <h3>👥 ルーム参加</h3>
+              </div>
+              <p class="modal-desc">
+                友達のルームロビー右上に表示されている <strong>ルームID</strong> を入力してください。
+              </p>
+              ${
+                this.modeSelectErrorMessage
+                  ? `<div class="mode-select-error-banner" style="margin-bottom:10px">⚠️ ${this.escapeHtml(this.modeSelectErrorMessage)}</div>`
+                  : ''
+              }
+              <div class="mode-field-group">
+                <label for="input-mode-join-code">ルームID</label>
+                <input
+                  id="input-mode-join-code"
+                  type="text"
+                  maxlength="8"
+                  value="${this.escapeHtml(this.lobbyJoinCodeInput)}"
+                  placeholder="例: 12345 / AB12CD"
+                  class="mode-text-input code-font"
+                />
+              </div>
+              <div class="modal-btn-row" style="margin-top:16px">
+                <button id="btn-close-join-modal" class="btn-white-pill">キャンセル</button>
+                <button id="btn-mode-join-room" class="btn-primary-gradient">参加する ❯</button>
+              </div>
+            </div>
+          </div>
+        `
+            : ''
+        }
+
+        ${this.renderSubOverlayModal()}
+      </div>
+    `;
+
+    // 1. 「＋ ルーム作成」ボタン押下 ➔ ロード画面 ➔ ルームロビーへ
+    this.container.querySelector('#btn-mode-create-room')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.soundManager.startBGM();
+      this.modeSelectErrorMessage = '';
+
+      this.runWithLoadingScreen({
+        title: '🏠 ルームを作成しています...',
+        steps: [
+          'ルーム設定とシード値を初期化中...',
+          'オンラインP2Pホスト部屋を開設中...',
+          'ルームロビー画面を準備しています...',
+        ],
+        minDurationMs: 1150,
+        task: async () => {
+          await this.roomManager.openP2PHostRoom(RoomManager.generateRoomId());
+          this.lobbyNoticeMessage = '';
+          return true;
+        },
+        onComplete: () => {
+          this.showScreen('LOBBY');
+        },
+      });
+    });
+
+    // 2. 「👥 ルーム参加」ボタン押下 ➔ ルームID入力モーダルを開く
+    this.container.querySelector('#btn-mode-open-join')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.soundManager.startBGM();
+      this.modeSelectErrorMessage = '';
+      this.isJoinRoomModalOpen = true;
+      this.render();
+    });
+
+    // 3. 「⚙️ 設定」ボタン押下 ➔ 設定モーダルを開く
+    this.container.querySelector('#btn-mode-settings')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.subModal = 'SETTINGS';
+      this.render();
+    });
+
+    // ルーム参加モーダル内の操作
+    const joinCodeEl = this.container.querySelector(
+      '#input-mode-join-code'
+    ) as HTMLInputElement | null;
+    joinCodeEl?.addEventListener('input', () => {
+      this.lobbyJoinCodeInput = joinCodeEl.value.toUpperCase();
+    });
+
+    this.container.querySelector('#btn-close-join-modal')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_cancel');
+      this.isJoinRoomModalOpen = false;
+      this.modeSelectErrorMessage = '';
+      this.render();
+    });
+
+    this.container.querySelector('#btn-mode-join-room')?.addEventListener('click', () => {
+      const code = (joinCodeEl?.value ?? this.lobbyJoinCodeInput).trim().toUpperCase();
+      this.lobbyJoinCodeInput = code;
+
+      if (code.length < 4) {
+        this.soundManager.playGlobalSound('ui_cancel');
+        this.modeSelectErrorMessage = '4文字以上のルームIDを入力してください。';
+        this.render();
+        return;
+      }
+
+      this.soundManager.playGlobalSound('ui_click');
+      this.modeSelectErrorMessage = '';
+      this.isJoinRoomModalOpen = false;
+
+      this.runWithLoadingScreen({
+        title: `🔑 ルーム (${code}) に参加しています...`,
+        steps: [
+          'P2Pシグナリングサーバーに接続中...',
+          `ルームID「${code}」のホストを検索しています...`,
+          'ロビー情報とプレイヤー枠を同期しています...',
+        ],
+        minDurationMs: 1200,
+        task: async () => {
+          const res = await this.roomManager.joinP2PRoomByCode(code);
+          if (!res.ok) {
+            this.modeSelectErrorMessage =
+              res.error ?? `ルーム「${code}」が見つかりませんでした。`;
+            this.isJoinRoomModalOpen = true;
+            return false;
+          }
+          this.lobbyNoticeMessage = `✅ ルーム ${code} に参加しました！`;
+          return true;
+        },
+        onComplete: () => {
+          this.showScreen('LOBBY');
+        },
+        onCancelOrFail: () => {
+          this.soundManager.playGlobalSound('ui_cancel');
+          this.showScreen('MODE_SELECT');
+        },
+      });
+    });
+
+    this.bindHomeSelectedCharWidgetEvents();
+    this.bindSubOverlayEvents();
+    this.bindLoginModalEvents();
+  }
+
+  // ==========================================
+  // 1.8 ロード画面 (LOADING)
+  // ==========================================
+  private renderLoadingScreen(): void {
+    const tip = LOADING_TIPS[this.loadingTipIndex % LOADING_TIPS.length];
+
+    this.container.innerHTML = `
+      <div class="screen-overlay loading-screen">
+        <div class="loading-center-card">
+          <div class="loading-dice-stage" aria-hidden="true">
+            <div class="loading-dice-bounce d1">${this.renderDiceSvgIcon(1, 54)}</div>
+            <div class="loading-dice-bounce d2">${this.renderDiceSvgIcon(5, 64)}</div>
+            <div class="loading-dice-bounce d3">${this.renderDiceSvgIcon(6, 54)}</div>
+          </div>
+
+          <h2 class="loading-main-title">${this.escapeHtml(this.loadingTitle)}</h2>
+          <p id="loading-subtext" class="loading-sub-status">${this.escapeHtml(this.loadingSubtext)}</p>
+
+          <div class="loading-progress-wrap">
+            <div class="loading-progress-track">
+              <div id="loading-progress-fill" class="loading-progress-fill" style="width: ${this.loadingProgress}%"></div>
+            </div>
+            <span id="loading-progress-pct" class="loading-progress-pct">${this.loadingProgress}%</span>
+          </div>
+
+          <div class="loading-tip-box">
+            <div class="loading-tip-header">💡 ${this.escapeHtml(tip.title)}</div>
+            <p class="loading-tip-body">${this.escapeHtml(tip.body)}</p>
+          </div>
+        </div>
+      </div>
+    `;
   }
 
   // ==========================================
@@ -347,30 +1154,20 @@ export class UIManager {
       const p = lobby.players[i];
       if (p) {
         const colorDef = THEME_COLORS[p.colorId];
-        const isMe = p.id === lobby.localPlayerId;
-        const canEditSlot = !isGuest || isMe;
         const canRemoveSlot = !isGuest && !p.isHost && lobby.players.length > 2;
 
         slotsHtml.push(`
-          <div
-            class="lobby-v2-player-row filled ${canEditSlot ? 'clickable' : ''}"
-            ${canEditSlot ? `data-edit-player="${p.id}" title="クリックでキャラ・色・名前を変更"` : ''}
-          >
+          <div class="lobby-v2-player-row filled toy-panel-slab" style="border-radius: 14px; box-shadow: 0 4px 0 #cbd5e1, 0 6px 12px rgba(15,23,42,0.06);">
             <div class="lobby-v2-player-left">
               <span class="lobby-v2-color-dot" style="background: ${colorDef.hex}"></span>
               <span class="lobby-v2-player-name">${this.escapeHtml(p.name)}</span>
               ${!p.isConnected ? '<span class="lobby-v2-mini-tag danger">切断中</span>' : ''}
             </div>
             <div class="lobby-v2-player-right">
-              ${p.isHost ? '<span class="lobby-v2-crown" title="ホスト">👑</span>' : ''}
-              ${
-                canEditSlot
-                  ? `<button class="lobby-v2-row-icon-btn" data-edit-player="${p.id}" title="キャラ・名前変更">✎</button>`
-                  : ''
-              }
+              ${p.isHost ? `<span class="lobby-v2-crown" title="ホスト" style="display:inline-flex;align-items:center;">${GameIcons.crown({ size: 24 })}</span>` : ''}
               ${
                 canRemoveSlot
-                  ? `<button class="lobby-v2-row-icon-btn remove" data-remove-player="${p.id}" title="枠を削除">✕</button>`
+                  ? `<button class="lobby-v2-row-icon-btn remove toy-btn" data-remove-player="${p.id}" title="枠を削除">✕</button>`
                   : ''
               }
             </div>
@@ -378,7 +1175,7 @@ export class UIManager {
         `);
       } else {
         slotsHtml.push(`
-          <div class="lobby-v2-player-row empty">
+          <div class="lobby-v2-player-row empty" style="border-radius: 14px;">
             <div class="lobby-v2-player-left">
               <span class="lobby-v2-empty-avatar" aria-hidden="true">
                 <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor">
@@ -391,8 +1188,8 @@ export class UIManager {
               !isGuest
                 ? `
               <div class="lobby-v2-empty-actions">
-                <button class="lobby-v2-slot-add-btn" data-add-cpu="true" title="CPUを追加">＋CPU</button>
-                <button class="lobby-v2-slot-add-btn" data-add-human="true" title="プレイヤー枠を追加">＋人間</button>
+                <button class="lobby-v2-slot-add-btn toy-btn toy-btn-white" data-add-cpu="true" title="CPUを追加" style="padding:4px 10px;font-size:0.75rem;">＋CPU</button>
+                <button class="lobby-v2-slot-add-btn toy-btn toy-btn-white" data-add-human="true" title="プレイヤー枠を追加" style="padding:4px 10px;font-size:0.75rem;">＋人間</button>
               </div>
             `
                 : ''
@@ -414,20 +1211,20 @@ export class UIManager {
           <!-- 上部ヘッダーバー (3カラム) -->
           <header class="lobby-v2-top-bar">
             <div class="lobby-v2-top-left">
-              <button id="btn-lobby-back" class="lobby-v2-back-pill">
-                <span class="back-arrow">⬅</span>
-                <span>戻る</span>
+              <button id="btn-lobby-back" class="toy-btn toy-btn-white" style="padding: 8px 18px; font-size: 0.95rem;">
+                <span style="display:inline-flex;align-items:center;gap:6px;">
+                  ${GameIcons.arrowBack({ size: 18 })}
+                  <span>戻る</span>
+                </span>
               </button>
             </div>
 
             <div class="lobby-v2-top-center">
               <div class="lobby-v2-title-row">
-                <span class="lobby-v2-house-icon" aria-hidden="true">
-                  <svg viewBox="0 0 24 24" width="32" height="32" fill="#1e3a8a">
-                    <path d="M12 3L2 12h3v8h5v-6h4v6h5v-8h3L12 3z"/>
-                  </svg>
+                <span class="lobby-v2-house-icon" aria-hidden="true" style="display:inline-flex;align-items:center;">
+                  ${GameIcons.pawn({ size: 32 })}
                 </span>
-                <h2>ルームロビー</h2>
+                <h2 style="font-size:1.6rem;font-weight:900;letter-spacing:0.03em;">ルームロビー</h2>
               </div>
               <div class="lobby-v2-title-underline">
                 <span class="seg-side"></span>
@@ -437,17 +1234,20 @@ export class UIManager {
             </div>
 
             <div class="lobby-v2-top-right">
-              <div class="lobby-v2-roomid-pill">
-                <span class="roomid-text">ルームID : <strong>${lobby.roomId}</strong></span>
-                <button id="btn-copy-invite" class="lobby-v2-copy-btn" title="ルームIDと招待URLをコピー">
-                  <svg viewBox="0 0 24 24" width="19" height="19" fill="none" stroke="#1e3a8a" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <div class="lobby-v2-roomid-pill toy-panel-slab" style="padding: 6px 16px; border-radius: 999px; box-shadow: 0 4px 0 #cbd5e1;">
+                <span class="roomid-text" style="font-size: 0.95rem;">ルームID : <strong>${lobby.roomId}</strong></span>
+                <button id="btn-copy-invite" class="lobby-v2-copy-btn toy-btn" title="ルームIDと招待URLをコピー" style="width:28px;height:28px;border-radius:50%;">
+                  <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="#1e3a8a" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round">
                     <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
                     <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
                   </svg>
                 </button>
               </div>
-              <button id="btn-toggle-join-drawer" class="lobby-v2-join-toggle-btn" title="友達のルームIDを入力して参加">
-                🔑 ID参加
+              <button id="btn-toggle-join-drawer" class="toy-btn toy-btn-white" style="padding: 6px 14px; font-size: 0.85rem;" title="友達のルームIDを入力して参加">
+                <span style="display:inline-flex;align-items:center;gap:4px;">
+                  ${GameIcons.lock({ size: 14 })}
+                  <span>ID参加</span>
+                </span>
               </button>
             </div>
           </header>
@@ -475,7 +1275,7 @@ export class UIManager {
           <!-- 中央2カラムカード -->
           <div class="lobby-v2-main-grid">
             <!-- 左カード：ルーム概要カード -->
-            <section class="lobby-v2-overview-card">
+            <section class="lobby-v2-overview-card toy-panel-slab">
               <div class="lobby-v2-overview-top">
                 <!-- 左サムネイル（街＋立体サイコロ） -->
                 <div class="lobby-v2-thumb-box">
@@ -505,7 +1305,7 @@ export class UIManager {
                   <div class="lobby-v2-meta-list">
                     <div class="lobby-v2-meta-row">
                       <span class="meta-label">
-                        <span class="meta-icon">🏁</span>
+                        <span class="meta-icon" style="display:inline-flex;align-items:center;">${GameIcons.dice({ size: 18 })}</span>
                         <span>ゲームモード</span>
                       </span>
                       <span class="meta-value">${ruleSummaryText}</span>
@@ -513,7 +1313,9 @@ export class UIManager {
 
                     <div class="lobby-v2-meta-row">
                       <span class="meta-label">
-                        <span class="meta-icon">🕒</span>
+                        <span class="meta-icon" style="display:inline-flex;align-items:center;">
+                          <svg viewBox="0 0 24 24" width="18" height="18" fill="#1e3a8a"><path d="M12 2C6.5 2 2 6.5 2 12s4.5 10 10 10 10-4.5 10-10S17.5 2 12 2zm0 18c-4.41 0-8-3.59-8-8s3.59-8 8-8 8 3.59 8 8-3.59 8-8 8zm.5-13H11v6l5.2 3.2.8-1.3-4.5-2.7V7z"/></svg>
+                        </span>
                         <span>プレイ時間</span>
                       </span>
                       <span class="meta-value">約 ${estMinutes} 分</span>
@@ -521,7 +1323,7 @@ export class UIManager {
 
                     <div class="lobby-v2-meta-row">
                       <span class="meta-label">
-                        <span class="meta-icon">👥</span>
+                        <span class="meta-icon" style="display:inline-flex;align-items:center;">${GameIcons.users({ size: 18 })}</span>
                         <span>参加人数</span>
                       </span>
                       <span class="meta-value">${lobby.players.length} / 6</span>
@@ -538,9 +1340,9 @@ export class UIManager {
             </section>
 
             <!-- 右カード：参加プレイヤー一覧カード -->
-            <section class="lobby-v2-players-card">
+            <section class="lobby-v2-players-card toy-panel-slab">
               <div class="lobby-v2-players-header">
-                <span class="players-header-icon" aria-hidden="true">👥</span>
+                <span class="players-header-icon" aria-hidden="true" style="display:inline-flex;align-items:center;">${GameIcons.users({ size: 22 })}</span>
                 <span>参加プレイヤー</span>
               </div>
               <div class="lobby-v2-players-list">
@@ -550,44 +1352,35 @@ export class UIManager {
           </div>
 
           <!-- 下部フローティングドックバー -->
-          <footer class="lobby-v2-bottom-dock">
+          <footer class="lobby-v2-bottom-dock toy-panel-slab">
             <div class="lobby-v2-dock-left">
               <div class="dock-cond-label">
-                <span class="cond-gear">⚙️</span>
+                <span class="cond-gear" style="display:inline-flex;align-items:center;">${GameIcons.gear({ size: 18 })}</span>
                 <span>終了条件</span>
               </div>
               <button
                 id="btn-cycle-rule"
-                class="lobby-v2-cond-pill"
+                class="lobby-v2-cond-pill toy-btn toy-btn-white"
+                style="padding: 10px 24px; font-size: 1rem;"
                 ${isGuest ? 'disabled' : ''}
                 title="クリックで終了条件（規定ターン数／制限時間）を切り替え"
               >
-                <span class="cond-sync-icon">🔄</span>
+                <span class="cond-sync-icon" style="display:inline-flex;align-items:center;">🔄</span>
                 <span>${ruleSummaryText}</span>
               </button>
-            </div>
-
-            <div class="lobby-v2-dock-divider"></div>
-
-            <div class="lobby-v2-dock-center">
-              <div class="dock-timer-icon" aria-hidden="true">🕒</div>
-              <div class="dock-timer-stack">
-                <span class="dock-timer-caption">開始まで</span>
-                <span id="lobby-start-countdown" class="dock-timer-digits">${this.formatLobbyCountdown()}</span>
-              </div>
             </div>
 
             <div class="lobby-v2-dock-right">
               ${
                 isGuest
                   ? `
-                <button class="lobby-v2-gold-start-btn" disabled>
-                  <span>⏳ ホスト開始待ち</span>
+                <button class="lobby-v2-gold-start-btn toy-btn" disabled style="opacity:0.6;cursor:not-allowed;">
+                  <span>ホスト開始待ち</span>
                 </button>
               `
                   : `
-                <button id="btn-lobby-start-game" class="lobby-v2-gold-start-btn">
-                  <span class="play-triangle">▶</span>
+                <button id="btn-lobby-start-game" class="lobby-v2-gold-start-btn toy-btn toy-btn-gold" style="padding: 14px 48px; font-size: 1.4rem;">
+                  <span class="play-triangle" style="font-size: 1.2rem;">▶</span>
                   <span>ゲーム開始</span>
                 </button>
               `
@@ -696,7 +1489,11 @@ export class UIManager {
           this.editingPlayerId = target.id;
           this.selectedCharId = target.characterId;
           this.selectedColorId = target.colorId;
+          this.selectedSkinId = target.skinId ?? 'standard';
           this.editingPlayerName = target.name;
+          this.charSelectNotice = '';
+          this.isLoginModalOpen = false;
+          this.charSelectReturnScreen = 'LOBBY';
           this.showScreen('CHAR_SELECT');
         }
       });
@@ -704,7 +1501,8 @@ export class UIManager {
 
     this.container.querySelector('#btn-lobby-back')?.addEventListener('click', () => {
       this.soundManager.playGlobalSound('ui_cancel');
-      this.showScreen('TITLE');
+      this.modeSelectErrorMessage = '';
+      this.showScreen('MODE_SELECT');
     });
 
     this.container.querySelector('#btn-lobby-rules')?.addEventListener('click', () => {
@@ -722,84 +1520,396 @@ export class UIManager {
   }
 
   // ==========================================
-  // 3. キャラクター選択画面 (CHAR_SELECT) - リファレンス右上パネル完全準拠
+  // 3. コマ＆スキン選択画面 (CHAR_SELECT) - 2カラム・ショーケース型UI＋Googleログイン必須スキン解放
   // ==========================================
   private renderCharSelectScreen(): void {
-    const selectedChar = CHARACTERS[this.selectedCharId];
-    const selectedColor = THEME_COLORS[this.selectedColorId];
+    const prog = progressionManager.getState();
+    const selectedChar = CHARACTERS[this.selectedCharId] ?? CHARACTERS.char_1;
+    const selectedColor = THEME_COLORS[this.selectedColorId] ?? THEME_COLORS.blue;
+    const selectedSkin = TOKEN_SKINS[this.selectedSkinId] ?? TOKEN_SKINS.standard;
 
-    const charCardsHtml = CHARACTER_LIST.map((c) => {
+    const isTokenUnlocked = progressionManager.isCharacterUnlocked(this.selectedCharId);
+    const isSkinUnlocked = progressionManager.isSkinUnlocked(this.selectedSkinId);
+    const canEquipCurrent = isTokenUnlocked && isSkinUnlocked;
+
+    const targetPlayer =
+      this.roomManager.getLobbyState().players.find((p) => p.id === this.editingPlayerId) ??
+      this.roomManager.getLocalPlayer();
+    const isAlreadyEquipped =
+      canEquipCurrent &&
+      targetPlayer.characterId === this.selectedCharId &&
+      targetPlayer.colorId === this.selectedColorId &&
+      (targetPlayer.skinId ?? 'standard') === this.selectedSkinId &&
+      targetPlayer.name === (this.editingPlayerName.trim() || targetPlayer.name);
+
+    // 左ペイン：大型3DトークンショーケースSVG（見切れ防止のためコンパクトな148px）
+    const showcaseSvg = renderTokenShowcaseSvg(
+      this.selectedCharId,
+      selectedColor.hex,
+      this.selectedSkinId,
+      148
+    );
+
+    // 左ペイン下部の解放アクションボタン（未解放のコマまたはスキンをプレビュー中の場合）
+    let unlockActionHtml = '';
+    if (!isTokenUnlocked) {
+      if (!prog.isLoggedIn) {
+        unlockActionHtml = `
+          <button id="btn-showcase-login-for-unlock" class="char-unlock-cta-btn login-required-btn toy-btn toy-btn-blue" style="padding: 10px 16px;">
+            <span style="display:inline-flex;align-items:center;gap:6px;">
+              ${GameIcons.lock({ size: 18 })}
+              <span>Googleログインして「${selectedChar.name}」を解放（${selectedChar.unlockCostCoins} コイン）</span>
+            </span>
+          </button>
+        `;
+      } else {
+        unlockActionHtml = `
+          <button id="btn-unlock-token" class="char-unlock-cta-btn coin-unlock-btn toy-btn toy-btn-gold" style="padding: 10px 16px;" ${prog.lifeCoins < selectedChar.unlockCostCoins ? 'disabled' : ''}>
+            <span style="display:inline-flex;align-items:center;gap:6px;">
+              ${GameIcons.coin({ size: 18 })}
+              <span>${selectedChar.unlockCostCoins} コインで「${selectedChar.name}」を解放する</span>
+            </span>
+          </button>
+        `;
+      }
+    } else if (!isSkinUnlocked) {
+      if (!prog.isLoggedIn) {
+        unlockActionHtml = `
+          <button id="btn-showcase-login-for-unlock" class="char-unlock-cta-btn login-required-btn toy-btn toy-btn-blue" style="padding: 10px 16px;">
+            <span style="display:inline-flex;align-items:center;gap:6px;">
+              ${GameIcons.lock({ size: 18 })}
+              <span>Googleログインして「${selectedSkin.name}」を解放（${selectedSkin.unlockCostCoins} コイン）</span>
+            </span>
+          </button>
+        `;
+      } else {
+        unlockActionHtml = `
+          <button id="btn-unlock-skin" class="char-unlock-cta-btn coin-unlock-btn toy-btn toy-btn-gold" style="padding: 10px 16px;" ${prog.lifeCoins < selectedSkin.unlockCostCoins ? 'disabled' : ''}>
+            <span style="display:inline-flex;align-items:center;gap:6px;">
+              ${GameIcons.coin({ size: 18 })}
+              <span>${selectedSkin.unlockCostCoins} コインで「${selectedSkin.name}」を解放する</span>
+            </span>
+          </button>
+        `;
+      }
+    }
+
+    // タブ1：立体コマ選択グリッド（全6種）
+    const tokenCardsHtml = CHARACTER_LIST.map((c) => {
       const isSelected = c.id === this.selectedCharId;
-      const imgUrl = characterAvatarUrls[c.id];
+      const unlocked = progressionManager.isCharacterUnlocked(c.id);
+      const previewSvg = renderTokenShowcaseSvg(
+        c.id,
+        isSelected ? selectedColor.hex : '#64748b',
+        isSelected ? this.selectedSkinId : 'standard',
+        66
+      );
       return `
-        <div class="char-select-card ${isSelected ? 'selected' : ''}" data-select-char="${c.id}" style="--active-color: ${selectedColor.hex}">
-          <div class="char-figure-stage">
-            <img src="${imgUrl}" alt="${c.name}" class="char-portrait-img" />
-            <div class="char-pedestal" style="border-color: ${isSelected ? selectedColor.hex : '#cbd5e1'}"></div>
+        <button
+          type="button"
+          class="token-grid-card ${isSelected ? 'selected' : ''} ${unlocked ? 'unlocked' : 'locked'}"
+          data-select-char="${c.id}"
+          style="--active-color: ${selectedColor.hex}"
+        >
+          <div class="token-card-top-row">
+            <span class="token-card-emoji">${GameIcons.pawn({ size: 18 })}</span>
+            ${
+              unlocked
+                ? `<span class="token-badge owned">${c.isInitialUnlocked ? '初期解放' : '所持済'}</span>`
+                : `<span class="token-badge locked" style="display:inline-flex;align-items:center;gap:3px;">${GameIcons.coin({ size: 12 })} <span>${c.unlockCostCoins}</span></span>`
+            }
           </div>
-          <div class="char-card-name">${c.name}</div>
-          <div class="char-card-title">${c.title}</div>
-        </div>
+          <div class="token-card-svg-wrap">${previewSvg}</div>
+          <div class="token-card-name">${c.name}</div>
+          <div class="token-card-subtitle">${c.title}</div>
+        </button>
       `;
     }).join('');
 
+    // タブ2：テーマカラー（5色）＆ マテリアルスキン（4種）
     const colorButtonsHtml = THEME_COLOR_LIST.map((col) => {
       const isSelected = col.id === this.selectedColorId;
       return `
         <button
-          class="color-swatch-btn ${isSelected ? 'selected' : ''}"
-          style="background-color: ${col.hex}"
+          type="button"
+          class="color-swatch-chip ${isSelected ? 'selected' : ''}"
           data-select-color="${col.id}"
-          title="${col.name}"
-        ></button>
+          style="--swatch-hex: ${col.hex}"
+        >
+          <span class="swatch-circle" style="background: ${col.hex}"></span>
+          <span class="swatch-label">${col.name}</span>
+        </button>
+      `;
+    }).join('');
+
+    const skinGradMap: Record<TokenSkinId, string> = {
+      standard: 'linear-gradient(135deg, #60a5fa, #2563eb)',
+      metallic_gold: 'linear-gradient(135deg, #fef08a, #f59e0b, #b45309)',
+      crystal_prism: 'linear-gradient(135deg, #e0f2fe, #67e8f9, #38bdf8)',
+      neon_cyber: 'linear-gradient(135deg, #22d3ee, #312e81, #a855f7)',
+    };
+
+    const skinCardsHtml = TOKEN_SKIN_LIST.map((skin) => {
+      const isSelected = skin.id === this.selectedSkinId;
+      const unlocked = progressionManager.isSkinUnlocked(skin.id);
+      return `
+        <button
+          type="button"
+          class="skin-list-card ${isSelected ? 'selected' : ''} ${unlocked ? 'unlocked' : 'locked'}"
+          data-select-skin="${skin.id}"
+        >
+          <div class="skin-card-left">
+            <span class="skin-swatch-preview" style="background: ${skinGradMap[skin.id]}">
+              ${GameIcons.pawn({ size: 22 })}
+            </span>
+            <div class="skin-card-text">
+              <div class="skin-card-title-row">
+                <strong>${skin.name}</strong>
+                ${
+                  unlocked
+                    ? `<span class="token-badge owned">${skin.unlockCostCoins === 0 ? '初期装備' : '解放済'}</span>`
+                    : `<span class="token-badge locked" style="display:inline-flex;align-items:center;gap:3px;">${GameIcons.coin({ size: 12 })} <span>${skin.unlockCostCoins}</span></span>`
+                }
+                ${
+                  !unlocked && skin.requiresLogin
+                    ? `<span class="token-badge login-req" style="display:inline-flex;align-items:center;gap:3px;">${GameIcons.lock({ size: 12 })} <span>要ログイン</span></span>`
+                    : ''
+                }
+              </div>
+              <p class="skin-card-desc">${skin.description}</p>
+            </div>
+          </div>
+        </button>
       `;
     }).join('');
 
     this.container.innerHTML = `
       <div class="screen-overlay char-select-screen">
-        <div class="glass-window char-select-window">
-          <div class="window-header">
-            <div class="header-title">
-              <span class="header-icon">👤</span>
-              <h2>キャラクター選択</h2>
+        <div class="glass-window char-showcase-window">
+          <!-- ヘッダーバー -->
+          <div class="window-header char-showcase-header">
+            <div class="header-title" style="display:flex;align-items:center;gap:10px;">
+              <button id="btn-char-back" class="toy-btn toy-btn-white" style="padding:6px 14px;font-size:0.9rem;">
+                <span style="display:inline-flex;align-items:center;gap:4px;">
+                  ${GameIcons.arrowBack({ size: 16 })}
+                  <span>戻る</span>
+                </span>
+              </button>
+              <span class="header-icon" style="display:inline-flex;align-items:center;">${GameIcons.pawn({ size: 28 })}</span>
+              <h2 style="font-size:1.4rem;font-weight:900;letter-spacing:0.02em;">立体コマ＆スキン選択</h2>
             </div>
-            <div class="name-input-group">
-              <label for="input-player-name">名前：</label>
-              <input id="input-player-name" type="text" maxlength="14" value="${this.escapeHtml(this.editingPlayerName)}" />
+
+            <div class="char-header-right">
+              <div class="name-input-group">
+                <label for="input-player-name">名前：</label>
+                <input id="input-player-name" type="text" maxlength="14" value="${this.escapeHtml(this.editingPlayerName)}" />
+              </div>
+
+              <div class="char-coin-balance-pill" title="試合終了時の順位・純資産に応じて獲得できます" style="display:inline-flex;align-items:center;gap:6px;">
+                <span class="coin-icon" style="display:inline-flex;align-items:center;">${GameIcons.coin({ size: 20 })}</span>
+                <span class="coin-val">${prog.lifeCoins.toLocaleString()}</span>
+                <span class="coin-unit">コイン</span>
+              </div>
+
+              ${
+                prog.isLoggedIn
+                  ? `
+                <button id="btn-account-status" class="char-auth-pill logged-in toy-btn toy-btn-white" style="padding:6px 14px;" title="クリックでログアウト確認">
+                  <span style="display:inline-flex;align-items:center;gap:6px;">
+                    ${GameIcons.check({ size: 16 })}
+                    <span>${this.escapeHtml(prog.email || 'Google連携済')}</span>
+                  </span>
+                </button>
+              `
+                  : `
+                <button id="btn-open-login-modal" class="char-auth-pill guest toy-btn toy-btn-white" style="padding:6px 14px;">
+                  <span style="display:inline-flex;align-items:center;gap:6px;">
+                    ${GameIcons.lock({ size: 16 })}
+                    <span>ログイン（スキン解放）</span>
+                  </span>
+                </button>
+              `
+              }
             </div>
           </div>
 
-          <div class="char-carousel-row">
-            <button id="btn-char-prev" class="carousel-arrow-btn" aria-label="前のキャラクター">❮</button>
-            <div class="char-cards-grid">
-              ${charCardsHtml}
+          ${
+            this.charSelectNotice
+              ? `<div class="char-showcase-notice">${this.escapeHtml(this.charSelectNotice)}</div>`
+              : ''
+          }
+
+          <!-- 2カラム・ショーケース本体 -->
+          <div class="char-showcase-body">
+            <!-- 左ペイン：大型3Dトークンステージ＆詳細カード -->
+            <div class="char-showcase-left" style="--showcase-color: ${selectedColor.hex}">
+              <div class="char-showcase-stage">
+                <div class="showcase-status-badge ${canEquipCurrent ? 'ready' : 'locked'}">
+                  ${
+                    canEquipCurrent
+                      ? `<span style="display:inline-flex;align-items:center;gap:4px;">${GameIcons.check({ size: 16 })} <span>使用可能（装備OK）</span></span>`
+                      : !prog.isLoggedIn
+                        ? `<span style="display:inline-flex;align-items:center;gap:4px;">${GameIcons.lock({ size: 16 })} <span>プレビュー中（解放にはログイン必須）</span></span>`
+                        : `<span style="display:inline-flex;align-items:center;gap:4px;">${GameIcons.lock({ size: 16 })} <span>プレビュー中（コインで解放可能）</span></span>`
+                  }
+                </div>
+                <div class="showcase-token-figure">
+                  ${showcaseSvg}
+                </div>
+              </div>
+
+              <div class="char-showcase-info-box">
+                <div class="showcase-info-header">
+                  <span class="showcase-token-title">${selectedChar.name}</span>
+                  <span class="showcase-token-subtitle">${selectedChar.title}</span>
+                </div>
+                <div class="showcase-tags-row">
+                  <span class="showcase-chip" style="border-color:${selectedColor.hex}; color:${selectedColor.hex}">
+                    ${selectedColor.name}
+                  </span>
+                  <span class="showcase-chip">
+                    ${selectedSkin.name}
+                  </span>
+                </div>
+                <p class="showcase-desc-text">${selectedChar.description}</p>
+                ${unlockActionHtml}
+              </div>
             </div>
-            <button id="btn-char-next" class="carousel-arrow-btn" aria-label="次のキャラクター">❯</button>
-          </div>
 
-          <div class="char-desc-banner">
-            <strong>${selectedChar.name}（${selectedChar.title}）</strong>：${selectedChar.description}
-          </div>
+            <!-- 右ペイン：2タブ切替（立体コマ選択 / カラー＆特別スキン） -->
+            <div class="char-showcase-right">
+              <div class="char-tabs-bar">
+                <button
+                  type="button"
+                  class="char-tab-btn ${this.charSelectTab === 'tokens' ? 'active' : ''}"
+                  data-char-tab="tokens"
+                >
+                  <span style="display:inline-flex;align-items:center;gap:6px;">
+                    ${GameIcons.pawn({ size: 18 })}
+                    <span>立体コマ選択（全6種）</span>
+                  </span>
+                </button>
+                <button
+                  type="button"
+                  class="char-tab-btn ${this.charSelectTab === 'skins' ? 'active' : ''}"
+                  data-char-tab="skins"
+                >
+                  <span style="display:inline-flex;align-items:center;gap:6px;">
+                    <span style="width:14px;height:14px;border-radius:50%;background:linear-gradient(135deg,#f59e0b,#3b82f6);display:inline-block;"></span>
+                    <span>カラー＆特別スキン</span>
+                  </span>
+                </button>
+              </div>
 
-          <div class="color-picker-row">
-            <span class="color-picker-label">カラー選択</span>
-            <div class="color-swatches">
-              ${colorButtonsHtml}
+              <div class="char-tab-panel">
+                ${
+                  this.charSelectTab === 'tokens'
+                    ? `
+                  <div class="token-cards-grid-v2">
+                    ${tokenCardsHtml}
+                  </div>
+                `
+                    : `
+                  <div class="skin-tab-content">
+                    <div class="skin-section-block">
+                      <h4 class="skin-section-title">🎨 テーマカラー（全5色・初期解放）</h4>
+                      <div class="color-swatch-bar">
+                        ${colorButtonsHtml}
+                      </div>
+                    </div>
+
+                    <div class="skin-section-block">
+                      <div class="skin-section-header-row">
+                        <h4 class="skin-section-title">✨ 特別マテリアルスキン（全4種）</h4>
+                        <span class="skin-login-hint">※特別スキンの解放にはGoogleログインが必要です</span>
+                      </div>
+                      <div class="skin-cards-stack">
+                        ${skinCardsHtml}
+                      </div>
+                    </div>
+                  </div>
+                `
+                }
+              </div>
             </div>
           </div>
 
-          <div class="window-footer centered">
-            <button id="btn-char-confirm" class="btn-primary-gradient btn-lg">
-              決定
+          <!-- フッター -->
+          <div class="window-footer char-showcase-footer">
+            <div class="footer-left-hint" style="display:inline-flex;align-items:center;gap:6px;">
+              <span style="display:inline-flex;align-items:center;">${GameIcons.coin({ size: 18 })}</span>
+              <span><strong>ライフコイン</strong> は試合終了時の順位・最終純資産・特別称号に応じて獲得できます！</span>
+            </div>
+            <button
+              id="btn-char-confirm"
+              class="toy-btn ${isAlreadyEquipped ? 'toy-btn-green' : 'toy-btn-blue'} char-equip-btn ${isAlreadyEquipped ? 'equipped' : ''}"
+              style="padding: 10px 28px; font-size: 1.05rem;"
+              ${!canEquipCurrent ? 'disabled title="未解放のコマまたはスキンが選択されています"' : ''}
+            >
+              ${
+                !canEquipCurrent
+                  ? `<span style="display:inline-flex;align-items:center;gap:6px;">${GameIcons.lock({ size: 18 })} <span>先にコマ・スキンを解放してください</span></span>`
+                  : isAlreadyEquipped
+                    ? `<span style="display:inline-flex;align-items:center;gap:6px;">${GameIcons.check({ size: 18 })} <span>現在の装備に設定済み</span></span>`
+                    : `<span style="display:inline-flex;align-items:center;gap:6px;">${GameIcons.pawn({ size: 18 })} <span>このコマ＆スキンを装備する</span></span>`
+              }
             </button>
           </div>
         </div>
+
+        <!-- スキン解放・アカウント連携用 Googleログインモーダル -->
+        ${this.renderLoginModal()}
       </div>
     `;
 
+    // 選択中のコマ・カラー・スキンが解放済みであれば即座に装備状態として保存するヘルパー（ホーム画面へは戻らない）
+    const applyEquipmentStayOnScreen = (showBanner = false) => {
+      const tokenOk = progressionManager.isCharacterUnlocked(this.selectedCharId);
+      const skinOk = progressionManager.isSkinUnlocked(this.selectedSkinId);
+      if (!tokenOk || !skinOk) return;
+
+      this.roomManager.updatePlayerCustomization(this.editingPlayerId, {
+        name: this.editingPlayerName,
+        characterId: this.selectedCharId,
+        colorId: this.selectedColorId,
+        skinId: this.selectedSkinId,
+      });
+
+      if (this.editingPlayerId === this.roomManager.getLocalPlayer().id) {
+        progressionManager.updateSelection({
+          displayName: this.editingPlayerName,
+          characterId: this.selectedCharId,
+          colorId: this.selectedColorId,
+          skinId: this.selectedSkinId,
+        });
+      }
+
+      if (showBanner) {
+        const cName = CHARACTERS[this.selectedCharId]?.name ?? '';
+        const sName = TOKEN_SKINS[this.selectedSkinId]?.name ?? '';
+        const colName = THEME_COLORS[this.selectedColorId]?.name ?? '';
+        this.charSelectNotice = `✅ 「${cName} ／ ${colName} ／ ${sName}」を装備しました！`;
+      }
+    };
+
+    // イベントバインド
     const nameInput = this.container.querySelector('#input-player-name') as HTMLInputElement | null;
     nameInput?.addEventListener('input', () => {
       this.editingPlayerName = nameInput.value;
+    });
+    nameInput?.addEventListener('change', () => {
+      applyEquipmentStayOnScreen(false);
+    });
+
+    this.container.querySelectorAll('[data-char-tab]').forEach((tabBtn) => {
+      tabBtn.addEventListener('click', (e) => {
+        const tab = (e.currentTarget as HTMLElement).getAttribute('data-char-tab') as
+          | 'tokens'
+          | 'skins';
+        this.soundManager.playGlobalSound('ui_click');
+        this.charSelectTab = tab;
+        this.render();
+      });
     });
 
     this.container.querySelectorAll('[data-select-char]').forEach((card) => {
@@ -807,43 +1917,143 @@ export class UIManager {
         const cid = (e.currentTarget as HTMLElement).getAttribute('data-select-char') as CharacterId;
         this.soundManager.playGlobalSound('ui_click');
         this.selectedCharId = cid;
+        this.charSelectNotice = '';
+        applyEquipmentStayOnScreen(false);
         this.render();
       });
-    });
-
-    this.container.querySelector('#btn-char-prev')?.addEventListener('click', () => {
-      this.soundManager.playGlobalSound('ui_click');
-      const idx = CHARACTER_LIST.findIndex((c) => c.id === this.selectedCharId);
-      const prevIdx = (idx - 1 + CHARACTER_LIST.length) % CHARACTER_LIST.length;
-      this.selectedCharId = CHARACTER_LIST[prevIdx].id;
-      this.render();
-    });
-
-    this.container.querySelector('#btn-char-next')?.addEventListener('click', () => {
-      this.soundManager.playGlobalSound('ui_click');
-      const idx = CHARACTER_LIST.findIndex((c) => c.id === this.selectedCharId);
-      const nextIdx = (idx + 1) % CHARACTER_LIST.length;
-      this.selectedCharId = CHARACTER_LIST[nextIdx].id;
-      this.render();
     });
 
     this.container.querySelectorAll('[data-select-color]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
-        const colId = (e.currentTarget as HTMLElement).getAttribute('data-select-color') as ThemeColorId;
+        const colId = (e.currentTarget as HTMLElement).getAttribute(
+          'data-select-color'
+        ) as ThemeColorId;
         this.soundManager.playGlobalSound('ui_click');
         this.selectedColorId = colId;
+        this.charSelectNotice = '';
+        applyEquipmentStayOnScreen(false);
         this.render();
       });
     });
 
-    this.container.querySelector('#btn-char-confirm')?.addEventListener('click', () => {
-      this.soundManager.playGlobalSound('ui_click');
-      this.roomManager.updatePlayerCustomization(this.editingPlayerId, {
-        name: this.editingPlayerName,
-        characterId: this.selectedCharId,
-        colorId: this.selectedColorId,
+    this.container.querySelectorAll('[data-select-skin]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const sid = (e.currentTarget as HTMLElement).getAttribute(
+          'data-select-skin'
+        ) as TokenSkinId;
+        this.soundManager.playGlobalSound('ui_click');
+        this.selectedSkinId = sid;
+        this.charSelectNotice = '';
+        applyEquipmentStayOnScreen(false);
+        this.render();
       });
-      this.showScreen('LOBBY');
+    });
+
+    // ログインモーダル表示（未ログイン時のスキン解放ボタン or ヘッダーログインボタン）
+    const openLoginModal = (reason: string) => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.loginModalReason = reason;
+      this.isLoginModalOpen = true;
+      this.render();
+    };
+
+    this.container.querySelector('#btn-open-login-modal')?.addEventListener('click', () => {
+      openLoginModal(
+        'Googleアカウントでログインすると、特別マテリアルスキンや報酬コマの解放機能をご利用いただけます。'
+      );
+    });
+
+    this.container.querySelector('#btn-showcase-login-for-unlock')?.addEventListener('click', () => {
+      openLoginModal(
+        '特別スキンおよび報酬コマを解放する際は、データ保護のためGoogleアカウントでのログインが必須となります。'
+      );
+    });
+
+    this.container.querySelector('#btn-close-login-modal')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_cancel');
+      this.isLoginModalOpen = false;
+      this.render();
+    });
+
+    this.container.querySelector('#btn-google-login-exec')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('event_good');
+      try {
+        window.sessionStorage.setItem('lifeboard_oauth_return_screen', 'CHAR_SELECT');
+        window.sessionStorage.setItem('lifeboard_oauth_return_tab', this.charSelectTab);
+      } catch {
+        // ignore
+      }
+      void progressionManager.signInWithGoogle().then((res) => {
+        this.isLoginModalOpen = false;
+        if (res.ok) {
+          this.charSelectNotice = res.message;
+        } else {
+          this.charSelectNotice = `⚠️ ${res.message}`;
+        }
+        this.render();
+      });
+    });
+
+    this.container.querySelector('#btn-account-status')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      if (window.confirm('ログアウトしますか？（ゲスト状態に戻ります）')) {
+        void progressionManager.signOut().then(() => {
+          this.selectedSkinId = 'standard';
+          if (!CHARACTERS[this.selectedCharId]?.isInitialUnlocked) {
+            this.selectedCharId = 'char_1';
+          }
+          this.charSelectNotice = 'ログアウトしました。';
+          this.render();
+        });
+      }
+    });
+
+    // コマ解放ボタン（解放と同時に装備し、この画面に留まる）
+    this.container.querySelector('#btn-unlock-token')?.addEventListener('click', () => {
+      const res = progressionManager.unlockCharacter(this.selectedCharId);
+      if (res.requiresLogin) {
+        openLoginModal(res.message);
+        return;
+      }
+      if (res.ok) {
+        this.soundManager.playGlobalSound('buy');
+        applyEquipmentStayOnScreen(false);
+        this.charSelectNotice = res.message;
+      } else {
+        this.soundManager.playGlobalSound('ui_cancel');
+        this.charSelectNotice = `⚠️ ${res.message}`;
+      }
+      this.render();
+    });
+
+    // スキン解放ボタン（解放と同時に装備し、この画面に留まる）
+    this.container.querySelector('#btn-unlock-skin')?.addEventListener('click', () => {
+      const res = progressionManager.unlockSkin(this.selectedSkinId);
+      if (res.requiresLogin) {
+        openLoginModal(res.message);
+        return;
+      }
+      if (res.ok) {
+        this.soundManager.playGlobalSound('buy');
+        applyEquipmentStayOnScreen(false);
+        this.charSelectNotice = res.message;
+      } else {
+        this.soundManager.playGlobalSound('ui_cancel');
+        this.charSelectNotice = `⚠️ ${res.message}`;
+      }
+      this.render();
+    });
+
+    this.container.querySelector('#btn-char-back')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_cancel');
+      this.showScreen(this.charSelectReturnScreen);
+    });
+
+    this.container.querySelector('#btn-char-confirm')?.addEventListener('click', () => {
+      if (!canEquipCurrent) return;
+      this.soundManager.playGlobalSound('ui_click');
+      applyEquipmentStayOnScreen(true);
+      this.render();
     });
   }
 
@@ -952,8 +2162,25 @@ export class UIManager {
           </div>
           <div class="hud-round-bar">
             <span class="round-chip">${ruleStatusText}</span>
-            <button id="btn-hud-camera" class="cam-toggle-btn">
-              ${this.mainScene.getCameraMode() === 'overview' ? '🗺️ 全体俯瞰 (ドラッグ旋回)' : '🎥 プレイヤー追従'}
+            <button id="btn-hud-camera" class="cam-toggle-btn" title="カメラモードを切り替え（全体俯瞰 / プレイヤー追従）">
+              ${
+                this.mainScene.getCameraMode() === 'overview'
+                  ? '🗺️ 全体俯瞰'
+                  : this.mainScene.getCameraMode() === 'follow'
+                  ? '🎥 プレイヤー追従'
+                  : '🧭 フリーカメラ'
+              }
+            </button>
+            <button
+              id="btn-hud-camera-reset"
+              class="cam-reset-btn"
+              title="プレイヤーのコマへ視点を戻す (Spaceキー)"
+              style="display: ${this.mainScene.getCameraMode() === 'free' ? 'inline-flex' : 'none'};"
+            >
+              📍 自コマに戻る (Space)
+            </button>
+            <button id="btn-hud-quick-settings" class="cam-toggle-btn" title="画面UIの大きさ・音量設定を開く">
+              ⚙️ 設定
             </button>
           </div>
         </div>
@@ -963,76 +2190,127 @@ export class UIManager {
           ${playerCardsHtml}
         </div>
 
+        <!-- 開発者モード：DEVフローティングボタン（管理者のみ表示） -->
+        ${
+          progressionManager.isDevAdmin()
+            ? `
+          <button id="btn-hud-dev-floating" class="dev-floating-btn toy-btn toy-btn-white" title="開発者コンソールを開く">
+            <span>🛠️ DEV</span>
+          </button>
+        `
+            : ''
+        }
+
         <!-- 左下：立体サイコロウィジェット ＆ アクションボタン群 -->
         <div class="hud-bottom-left">
-          <div class="dice-widget-box">
-            ${this.renderDiceSvgIcon(engine.lastDiceValue, 64)}
-          </div>
-
-          <div class="hud-action-cluster">
-            ${
-              canActPreMove
-                ? `
-              <button id="btn-hud-roll" class="btn-primary-gradient btn-roll-main">
-                🎲 サイコロを振る
-              </button>
+          ${
+            canActPreMove
+              ? `
+            <button id="btn-hud-roll" class="toy-giant-dice-btn" title="クリックでサイコロを振る！">
+              <div class="toy-dice-bounce-wrap">
+                ${GameIcons.dice({ size: 84 })}
+              </div>
+              <span class="toy-dice-caption-badge">サイコロを振る</span>
+            </button>
+            <div class="hud-action-cluster">
               <div class="pre-move-sub-actions">
-                <button id="btn-hud-item" class="btn-sub-action" ${current.usedItemThisTurn ? 'disabled' : ''}>
-                  🎒 アイテム使用
+                <button id="btn-hud-item" class="toy-btn toy-btn-white btn-sub-action" ${current.usedItemThisTurn ? 'disabled' : ''}>
+                  <span style="display:inline-flex;align-items:center;gap:4px;">
+                    <span>🎒</span>
+                    <span>アイテム使用</span>
+                  </span>
                 </button>
-                <button id="btn-hud-trade" class="btn-sub-action" ${current.proposedTradeThisTurn || current.inJail ? 'disabled' : ''}>
-                  🤝 取引（トレード）
+                <button id="btn-hud-trade" class="toy-btn toy-btn-white btn-sub-action" ${current.proposedTradeThisTurn || current.inJail ? 'disabled' : ''}>
+                  <span style="display:inline-flex;align-items:center;gap:4px;">
+                    <span>🤝</span>
+                    <span>取引（トレード）</span>
+                  </span>
                 </button>
-                <button id="btn-hud-sell" class="btn-sub-action" ${engine.getPlayerOwnedTiles(current.id).length === 0 ? 'disabled' : ''}>
-                  🏢 物件売却
+                <button id="btn-hud-sell" class="toy-btn toy-btn-white btn-sub-action" ${engine.getPlayerOwnedTiles(current.id).length === 0 ? 'disabled' : ''}>
+                  <span style="display:inline-flex;align-items:center;gap:4px;">
+                    <span>🏢</span>
+                    <span>物件売却</span>
+                  </span>
                 </button>
               </div>
-            `
-                : canEndTurn
-                  ? `
-              <button id="btn-hud-end-turn" class="btn-primary-gradient btn-roll-main">
-                ✅ ターン終了
+            </div>
+          `
+              : canEndTurn
+                ? `
+            <div class="hud-action-cluster">
+              <button id="btn-hud-end-turn" class="toy-btn toy-btn-green" style="padding: 16px 42px; font-size: 1.35rem;">
+                <span style="display:inline-flex;align-items:center;gap:8px;">
+                  ${GameIcons.check({ size: 24 })}
+                  <span>ターン終了</span>
+                </span>
               </button>
-            `
-                  : `
-              <div class="hud-waiting-banner">
+            </div>
+          `
+                : `
+            <div class="dice-widget-box toy-panel-slab" style="box-shadow: 0 6px 0 #cbd5e1;">
+              ${this.renderDiceSvgIcon(engine.lastDiceValue, 64)}
+            </div>
+            <div class="hud-action-cluster">
+              <div class="hud-waiting-banner toy-panel-slab" style="box-shadow: 0 4px 0 #cbd5e1;">
                 ${
                   current.isCpu
-                    ? `🤖 ${this.escapeHtml(current.name)} が行動を選択しています...`
+                    ? `<span>🤖 ${this.escapeHtml(current.name)} が行動を選択しています...</span>`
                     : engine.phase === 'MOVING'
-                      ? `🎲 出目【${engine.lastDiceValue}】で移動中...（残り ${engine.remainingMoveSteps} マス）`
+                      ? `<span style="display:inline-flex;align-items:center;gap:6px;">${GameIcons.dice({ size: 18 })} <span>出目【${engine.lastDiceValue}】で移動中...（残り ${engine.remainingMoveSteps} マス）</span></span>`
                       : !this.roomManager.canLocalPlayerControl(current.id)
-                        ? `🌐 ${this.escapeHtml(current.name)} が操作中...`
-                        : `⏳ イベント・アクション処理中...`
+                        ? `<span>🌐 ${this.escapeHtml(current.name)} が操作中...</span>`
+                        : `<span>⏳ イベント・アクション処理中...</span>`
                 }
               </div>
-            `
-            }
-          </div>
+            </div>
+          `
+          }
         </div>
 
-        <!-- 中央下：最新ログフィード -->
-        <div class="hud-bottom-center">
-          <div id="hud-toast-container" class="hud-toast-stack"></div>
-          <div class="hud-mini-log-bar">
-            ${
-              engine.logs[0]
-                ? `<span class="log-latest-text">${this.escapeHtml(engine.logs[0].message)}</span>`
-                : ''
-            }
-          </div>
-        </div>
-
-        <!-- 右下：メニューボタン -->
-        <div class="hud-bottom-right">
-          <button id="btn-hud-menu" class="btn-circle-menu" title="メニュー・ルール・設定">
-            ☰
+        <!-- 画面右下：行動ログ履歴パネル＆表示・非表示トグルボタン -->
+        <div class="hud-bottom-right-log">
+          <button id="btn-toggle-log-panel" class="toy-btn toy-btn-white btn-log-toggle" title="${this.isLogPanelVisible ? 'ログを非表示にする' : 'ログを表示する'}">
+            <span style="display:inline-flex;align-items:center;gap:6px;">
+              <span>📜 行動ログ</span>
+              <span class="log-toggle-arrow">${this.isLogPanelVisible ? '▼' : '▲'}</span>
+            </span>
           </button>
+
+          ${
+            this.isLogPanelVisible
+              ? `
+            <div class="hud-log-box toy-panel-slab">
+              <div class="hud-log-header">
+                <span>直近のプレイヤー行動ログ</span>
+                <span class="hud-log-count">${engine.logs.length}件</span>
+              </div>
+              <div class="hud-log-feed">
+                ${
+                  engine.logs.length === 0
+                    ? '<div class="hud-log-empty">まだログはありません</div>'
+                    : engine.logs
+                        .slice(0, 6)
+                        .map(
+                          (log) => `
+                        <div class="hud-log-entry type-${log.type}">
+                          <span class="log-dot"></span>
+                          <span class="log-msg-text">${this.escapeHtml(log.message)}</span>
+                        </div>
+                      `
+                        )
+                        .join('')
+                }
+              </div>
+            </div>
+          `
+              : ''
+          }
         </div>
 
         <!-- ゲームエンジン連動モーダル / サブモーダル -->
         ${this.renderEnginePendingModal()}
         ${this.renderSubOverlayModal()}
+        ${this.renderSellConfirmModal()}
       </div>
     `;
 
@@ -1040,6 +2318,7 @@ export class UIManager {
     this.bindGameHudEvents();
     this.bindEngineModalEvents();
     this.bindSubOverlayEvents();
+    this.bindSellConfirmEvents();
   }
 
   private updateToastDOM(): void {
@@ -1056,6 +2335,38 @@ export class UIManager {
       .join('');
   }
 
+  public setUiScale(scale: number): void {
+    this.uiScale = Math.max(0.7, Math.min(1.3, Math.round(scale * 100) / 100));
+    try {
+      localStorage.setItem('lifeboard_ui_scale', this.uiScale.toString());
+    } catch {
+      // ignore
+    }
+    this.applyUiScale();
+  }
+
+  private applyUiScale(): void {
+    document.documentElement.style.setProperty('--hud-ui-scale', this.uiScale.toString());
+  }
+
+  private updateCameraHud(): void {
+    const camBtn = this.container.querySelector<HTMLButtonElement>('#btn-hud-camera');
+    const resetBtn = this.container.querySelector<HTMLButtonElement>('#btn-hud-camera-reset');
+    const mode = this.mainScene.getCameraMode();
+
+    if (camBtn) {
+      camBtn.textContent =
+        mode === 'overview'
+          ? '🗺️ 全体俯瞰'
+          : mode === 'follow'
+          ? '🎥 プレイヤー追従'
+          : '🧭 フリーカメラ';
+    }
+    if (resetBtn) {
+      resetBtn.style.display = mode === 'free' ? 'inline-flex' : 'none';
+    }
+  }
+
   private bindGameHudEvents(): void {
     if (!this.engine) return;
     const engine = this.engine;
@@ -1064,7 +2375,23 @@ export class UIManager {
     this.container.querySelector('#btn-hud-camera')?.addEventListener('click', () => {
       this.soundManager.playGlobalSound('ui_click');
       this.mainScene.toggleCameraMode();
+      this.updateCameraHud();
+    });
+
+    this.container.querySelector('#btn-hud-camera-reset')?.addEventListener('click', () => {
+      this.mainScene.resetCameraToPlayer();
+      this.updateCameraHud();
+    });
+
+    this.container.querySelector('#btn-hud-quick-settings')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.subModal = 'SETTINGS';
       this.render();
+    });
+
+    this.container.querySelector('#btn-hud-dev-floating')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.devConsole.toggle();
     });
 
     this.container.querySelector('#btn-hud-roll')?.addEventListener('click', () => {
@@ -1106,9 +2433,9 @@ export class UIManager {
       this.render();
     });
 
-    this.container.querySelector('#btn-hud-menu')?.addEventListener('click', () => {
+    this.container.querySelector('#btn-toggle-log-panel')?.addEventListener('click', () => {
       this.soundManager.playGlobalSound('ui_click');
-      this.subModal = 'PAUSE_MENU';
+      this.isLogPanelVisible = !this.isLogPanelVisible;
       this.render();
     });
 
@@ -1222,13 +2549,69 @@ export class UIManager {
           current.jobId
         );
 
+        const propImg =
+          (tile.groupId && propertyIllustrationUrls[tile.groupId]) ||
+          propertyIllustrationUrls['G_GREEN'] ||
+          '';
+
+        if (this.isPropertyModalMinimized) {
+          // 最小化表示（画面右下に浮島を見渡せるトイカードドックとして配置）
+          return `
+            <div class="prop-minimized-dock toy-panel-slab" style="--prop-color: ${tile.groupColor ?? '#3b82f6'};">
+              <div class="dock-left-info">
+                ${
+                  propImg
+                    ? `<img src="${propImg}" class="dock-prop-thumb" alt="${this.escapeHtml(tile.name)}" />`
+                    : `<span class="dock-color-bar" style="background:${tile.groupColor ?? '#3b82f6'}"></span>`
+                }
+                <div class="dock-text-col">
+                  <div class="dock-title-row">
+                    <span class="dock-prop-name">${this.escapeHtml(tile.name)}</span>
+                    <span class="dock-group-tag">${tile.groupName ?? 'エリア'}</span>
+                  </div>
+                  <div class="dock-price-val">購入価格: <strong>${cost.toLocaleString()}万円</strong></div>
+                </div>
+              </div>
+              <div class="dock-btn-row">
+                <button id="btn-prop-restore" class="toy-btn toy-btn-white" style="padding:6px 12px;font-size:0.85rem;" title="詳細モーダルを開く">
+                  🔍 詳細
+                </button>
+                <button id="btn-prop-pass" class="toy-btn toy-btn-white" style="padding:6px 14px;font-size:0.9rem;" ${!isInteractive ? 'disabled' : ''}>
+                  見送る
+                </button>
+                <button id="btn-prop-buy" class="toy-btn toy-btn-gold" style="padding:8px 20px;font-size:1rem;" ${!isInteractive || !canAfford ? 'disabled' : ''}>
+                  購入 (${cost.toLocaleString()}万)
+                </button>
+              </div>
+            </div>
+          `;
+        }
+
         return `
           <div class="modal-backdrop">
-            <div class="modal-card">
-              <div class="modal-header" style="background: ${tile.groupColor ?? '#3b82f6'}">
-                <h3>🏠 物件購入チャンス：${this.escapeHtml(tile.name)}</h3>
+            <div class="modal-card toy-panel-slab prop-purchase-toy-card">
+              <div class="modal-header prop-toy-header" style="background: ${tile.groupColor ?? '#3b82f6'}">
+                <div class="prop-header-left">
+                  <span class="prop-header-icon">${GameIcons.pawn({ size: 24 })}</span>
+                  <h3>物件購入チャンス：${this.escapeHtml(tile.name)}</h3>
+                </div>
+                <button id="btn-prop-minimize" class="toy-btn toy-btn-white btn-mini-dock" title="モーダルを最小化してマップを見渡す">
+                  🔍 マップを見渡す
+                </button>
               </div>
-              <div class="modal-body">
+
+              ${
+                propImg
+                  ? `
+                <div class="prop-hero-image-wrap">
+                  <img src="${propImg}" alt="${this.escapeHtml(tile.name)}" class="prop-hero-img" />
+                  <span class="prop-hero-tag">${tile.groupName ?? 'エリア'}</span>
+                </div>
+              `
+                  : ''
+              }
+
+              <div class="modal-body prop-toy-body">
                 <div class="prop-summary-box">
                   <div class="prop-badge-row">
                     <span class="prop-group-pill" style="background:${tile.groupColor ?? '#3b82f6'}">${tile.groupName ?? 'エリア'}</span>
@@ -1262,7 +2645,7 @@ export class UIManager {
                           (ot) => `
                         <div class="inline-sell-item">
                           <span>${this.escapeHtml(ot.name)} (Lv${ot.level ?? 1})</span>
-                          <button class="btn-mini-sell" data-inline-sell="${ot.id}" ${!isInteractive ? 'disabled' : ''}>
+                          <button class="btn-mini-sell toy-btn toy-btn-white" data-inline-sell="${ot.id}" ${!isInteractive ? 'disabled' : ''}>
                             売却 (+${calculateBankSellValue(ot)}万)
                           </button>
                         </div>
@@ -1276,10 +2659,10 @@ export class UIManager {
                 }
 
                 <div class="modal-footer-btns">
-                  <button id="btn-prop-pass" class="btn-white-pill" ${!isInteractive ? 'disabled' : ''}>
+                  <button id="btn-prop-pass" class="toy-btn toy-btn-white" style="padding:10px 24px;font-size:1rem;" ${!isInteractive ? 'disabled' : ''}>
                     見送る
                   </button>
-                  <button id="btn-prop-buy" class="btn-primary-gradient" ${!isInteractive || !canAfford ? 'disabled' : ''}>
+                  <button id="btn-prop-buy" class="toy-btn toy-btn-gold" style="padding:12px 32px;font-size:1.1rem;" ${!isInteractive || !canAfford ? 'disabled' : ''}>
                     購入する（${cost.toLocaleString()}万円）
                   </button>
                 </div>
@@ -1301,15 +2684,34 @@ export class UIManager {
           { ...tile, level: nextLv },
           engine.tiles
         );
+        const propImg =
+          (tile.groupId && propertyIllustrationUrls[tile.groupId]) ||
+          propertyIllustrationUrls['G_GREEN'] ||
+          '';
 
         return `
           <div class="modal-backdrop">
-            <div class="modal-card">
-              <div class="modal-header" style="background: ${tile.groupColor ?? '#eab308'}">
-                <h3>🏗️ 物件強化：${this.escapeHtml(tile.name)} (Lv${curLv} ➔ Lv${nextLv})</h3>
+            <div class="modal-card toy-panel-slab prop-purchase-toy-card">
+              <div class="modal-header prop-toy-header" style="background: ${tile.groupColor ?? '#eab308'}">
+                <div class="prop-header-left">
+                  <span class="prop-header-icon">🏗️</span>
+                  <h3>物件強化：${this.escapeHtml(tile.name)} (Lv${curLv} ➔ Lv${nextLv})</h3>
+                </div>
               </div>
-              <div class="modal-body">
-                <p class="modal-lead">自己所有物件に止まりました！増築して資産価値と収益を引き上げますか？</p>
+
+              ${
+                propImg
+                  ? `
+                <div class="prop-hero-image-wrap">
+                  <img src="${propImg}" alt="${this.escapeHtml(tile.name)}" class="prop-hero-img" />
+                  <span class="prop-hero-tag">${tile.groupName ?? 'エリア'} (Lv${curLv} ➔ Lv${nextLv})</span>
+                </div>
+              `
+                  : ''
+              }
+
+              <div class="modal-body prop-toy-body">
+                <p class="modal-lead" style="margin-top:4px; font-weight:700; color:#475569;">自己所有物件に止まりました！増築して資産価値と収益を引き上げますか？</p>
                 <div class="prop-summary-box">
                   <div class="prop-stats-grid">
                     <div><span>強化費用</span><strong>${upgradeCost.toLocaleString()}万円</strong></div>
@@ -1318,10 +2720,10 @@ export class UIManager {
                   </div>
                 </div>
                 <div class="modal-footer-btns">
-                  <button id="btn-upgrade-pass" class="btn-white-pill" ${!isInteractive ? 'disabled' : ''}>
+                  <button id="btn-upgrade-pass" class="toy-btn toy-btn-white" style="padding:10px 24px;font-size:1rem;" ${!isInteractive ? 'disabled' : ''}>
                     見送る
                   </button>
-                  <button id="btn-upgrade-confirm" class="btn-primary-gradient" ${!isInteractive || !canAfford ? 'disabled' : ''}>
+                  <button id="btn-upgrade-confirm" class="toy-btn toy-btn-gold" style="padding:12px 32px;font-size:1.1rem;" ${!isInteractive || !canAfford ? 'disabled' : ''}>
                     Lv${nextLv} に強化する（${upgradeCost.toLocaleString()}万円）
                   </button>
                 </div>
@@ -1704,23 +3106,38 @@ export class UIManager {
       });
     });
 
-    // 物件購入・上限時のその場売却
+    // 物件購入・上限時のその場売却（確認ダイアログ表示）
     this.container.querySelectorAll('[data-inline-sell]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
         const tid = Number((e.currentTarget as HTMLElement).getAttribute('data-inline-sell'));
-        this.soundManager.playGlobalSound('buy');
-        engine.sellPropertyToBank(current.id, tid, false);
+        this.soundManager.playGlobalSound('ui_click');
+        this.pendingSellTileId = tid;
+        this.render();
       });
     });
 
     this.container.querySelector('#btn-prop-buy')?.addEventListener('click', () => {
       this.soundManager.playGlobalSound('buy');
+      this.isPropertyModalMinimized = false;
       engine.handlePropertyPurchaseDecision(current.id, true, false);
     });
 
     this.container.querySelector('#btn-prop-pass')?.addEventListener('click', () => {
       this.soundManager.playGlobalSound('ui_cancel');
+      this.isPropertyModalMinimized = false;
       engine.handlePropertyPurchaseDecision(current.id, false, false);
+    });
+
+    this.container.querySelector('#btn-prop-minimize')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.isPropertyModalMinimized = true;
+      this.render();
+    });
+
+    this.container.querySelector('#btn-prop-restore')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_click');
+      this.isPropertyModalMinimized = false;
+      this.render();
     });
 
     // 物件強化
@@ -1902,6 +3319,27 @@ export class UIManager {
             <span class="result-hint-text">プレイヤーをクリックすると資産内訳グラフが切り替わります</span>
           </div>
 
+          ${
+            this.lastMatchReward
+              ? `
+            <div class="result-coin-reward-banner">
+              <div class="reward-banner-left">
+                <span class="reward-coin-icon">🪙</span>
+                <div>
+                  <div class="reward-banner-title">ライフコイン獲得ボーナス！ +${this.lastMatchReward.totalEarned} コイン</div>
+                  <div class="reward-banner-breakdown">
+                    順位ボーナス +${this.lastMatchReward.rankBonus} ／ 純資産ボーナス +${this.lastMatchReward.netWorthBonus} ／ 称号ボーナス +${this.lastMatchReward.awardBonus}
+                  </div>
+                </div>
+              </div>
+              <div class="reward-banner-total">
+                所持合計：<strong>🪙 ${progressionManager.getState().lifeCoins.toLocaleString()}</strong>
+              </div>
+            </div>
+          `
+              : ''
+          }
+
           <div class="result-body-grid">
             <!-- 左側：純資産ランキングリスト -->
             <div class="result-ranking-col">
@@ -2027,6 +3465,95 @@ export class UIManager {
   }
 
   // ==========================================
+  // 物件売却確認ダイアログ（トイカード調）
+  // ==========================================
+  private renderSellConfirmModal(): string {
+    if (!this.engine || this.pendingSellTileId === null) return '';
+    const tile = this.engine.getTileById(this.pendingSellTileId);
+    if (!tile) return '';
+
+    const valuation = calculatePropertyValuation(tile);
+    const sellValue = calculateBankSellValue(tile);
+    const lossValue = valuation - sellValue;
+
+    return `
+      <div class="modal-backdrop" style="z-index: 12000; animation: fadeIn 0.2s ease;">
+        <div class="modal-card toy-panel-slab" style="max-width: 440px; text-align: center; border-top: 6px solid #ef4444; padding: 24px 20px;">
+          <div style="font-size: 2.2rem; margin-bottom: 8px;">🏢</div>
+          <h3 style="color: #ef4444; font-size: 1.3rem; margin: 0 0 16px 0; font-weight: 900;">
+            本当に売却しますか？
+          </h3>
+
+          <div style="background: #f8fafc; border: 2px solid #e2e8f0; border-radius: 16px; padding: 16px; margin-bottom: 16px; text-align: left;">
+            <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 6px;">
+              <span style="font-size: 0.82rem; font-weight: bold; color: ${tile.groupColor || '#38bdf8'};">
+                ● ${this.escapeHtml(tile.groupName || '不動産物件')}
+              </span>
+              <span style="font-size: 0.8rem; background: #e2e8f0; color: #334155; padding: 2px 8px; border-radius: 999px; font-weight: bold;">
+                Lv${tile.level ?? 1}
+              </span>
+            </div>
+
+            <div style="font-size: 1.25rem; font-weight: 900; color: #0f172a; margin-bottom: 12px;">
+              ${this.escapeHtml(tile.name)}
+            </div>
+
+            <div style="display: flex; justify-content: space-between; font-size: 0.9rem; color: #64748b; margin-bottom: 4px;">
+              <span>投資評価額:</span>
+              <span style="font-weight: bold; color: #334155;">${valuation.toLocaleString()}万円</span>
+            </div>
+
+            <div style="display: flex; justify-content: space-between; font-size: 1.1rem; color: #15803d; font-weight: 900; border-top: 1px dashed #cbd5e1; padding-top: 8px; margin-top: 8px;">
+              <span>銀行売却受取額 (70%):</span>
+              <span>+${sellValue.toLocaleString()}万円</span>
+            </div>
+
+            <div style="font-size: 0.78rem; color: #ef4444; text-align: right; margin-top: 2px;">
+              ※${lossValue.toLocaleString()}万円の売却損
+            </div>
+          </div>
+
+          <p style="font-size: 0.84rem; color: #64748b; line-height: 1.5; margin: 0 0 20px 0; text-align: left;">
+            ⚠️ <strong>注意:</strong> 売却すると所有権を失い、他プレイヤーからの通行料収入が得られなくなります。再度所有するにはそのマスに止まる必要があります。
+          </p>
+
+          <div style="display: flex; gap: 12px; justify-content: center;">
+            <button id="btn-cancel-sell-confirm" class="toy-btn toy-btn-white" style="flex: 1; min-height: 48px; font-size: 1rem;">
+              キャンセル
+            </button>
+            <button id="btn-execute-sell-confirm" class="toy-btn" style="flex: 1.2; min-height: 48px; font-size: 1rem; background: #ef4444; color: #ffffff; border-color: #fca5a5; box-shadow: 0 4px 0 #b91c1c;">
+              🏢 売却する
+            </button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  private bindSellConfirmEvents(): void {
+    if (this.pendingSellTileId === null || !this.engine) return;
+
+    this.container.querySelector('#btn-cancel-sell-confirm')?.addEventListener('click', () => {
+      this.soundManager.playGlobalSound('ui_cancel');
+      this.pendingSellTileId = null;
+      this.render();
+    });
+
+    this.container.querySelector('#btn-execute-sell-confirm')?.addEventListener('click', () => {
+      if (!this.engine || this.pendingSellTileId === null) return;
+      const tid = this.pendingSellTileId;
+      const current = this.engine.getCurrentPlayer();
+      this.soundManager.playGlobalSound('buy');
+      this.engine.sellPropertyToBank(current.id, tid, false);
+      this.pendingSellTileId = null;
+      if (this.subModal === 'BANK_SELL') {
+        this.subModal = 'NONE';
+      }
+      this.render();
+    });
+  }
+
+  // ==========================================
   // サブオーバーレイモーダル（設定 / ヘルプ / アイテム使用 / トレード作成 / 物件売却 / 詳細確認）
   // ==========================================
   private renderSubOverlayModal(): string {
@@ -2037,13 +3564,25 @@ export class UIManager {
         const lobby = this.roomManager.getLobbyState();
         const volPercent = Math.round(this.soundManager.getVolume() * 100);
         const isMuted = this.soundManager.getMuted();
+        const scalePercent = Math.round(this.uiScale * 100);
         return `
           <div class="modal-backdrop">
             <div class="modal-card">
               <div class="modal-header">
-                <h3>⚙️ サウンド＆オンライン接続設定</h3>
+                <h3>⚙️ ゲーム設定（UI表示・サウンド・接続）</h3>
               </div>
               <div class="modal-body">
+                <div class="settings-row">
+                  <label>🖥️ 画面UIの大きさ (<span id="text-ui-scale-val">${scalePercent}%</span>)</label>
+                  <div class="ui-scale-control-wrap">
+                    <input id="input-ui-scale-slider" type="range" min="70" max="130" step="5" value="${scalePercent}" />
+                    <div class="ui-scale-preset-btns">
+                      <button type="button" data-ui-scale-preset="0.80" class="btn-white-pill ${scalePercent === 80 ? 'active-scale' : ''}">小さめ (80%)</button>
+                      <button type="button" data-ui-scale-preset="1.00" class="btn-white-pill ${scalePercent === 100 ? 'active-scale' : ''}">標準 (100%)</button>
+                      <button type="button" data-ui-scale-preset="1.20" class="btn-white-pill ${scalePercent === 120 ? 'active-scale' : ''}">大きめ (120%)</button>
+                    </div>
+                  </div>
+                </div>
                 <div class="settings-row">
                   <label>🔊 マスター音量 (${volPercent}%)</label>
                   <input id="input-volume-slider" type="range" min="0" max="100" value="${volPercent}" />
@@ -2426,18 +3965,51 @@ export class UIManager {
       case 'PAUSE_MENU': {
         return `
           <div class="modal-backdrop">
-            <div class="modal-card">
-              <div class="modal-header">
-                <h3>☰ ゲームメニュー</h3>
-              </div>
-              <div class="modal-body">
-                <div class="choice-stack">
-                  <button id="btn-menu-settings" class="choice-option-btn">⚙️ サウンド・音量設定</button>
-                  <button id="btn-menu-help" class="choice-option-btn">📖 ルール確認</button>
-                  <button id="btn-menu-lobby" class="choice-option-btn">🏠 対戦を終了してロビーへ戻る</button>
+            <div class="modal-card toy-panel-slab" style="width: min(440px, 92vw); padding: 0; overflow: hidden; border-radius: 28px;">
+              <div class="modal-header prop-toy-header" style="background: linear-gradient(135deg, #1e3a8a 0%, #2563eb 100%);">
+                <div class="prop-header-left">
+                  <span class="prop-header-icon">${GameIcons.gear({ size: 24 })}</span>
+                  <h3 style="margin:0;">ポーズメニュー</h3>
                 </div>
-                <div class="modal-footer-btns">
-                  <button data-close-submodal="true" class="btn-primary-gradient">ゲームに戻る</button>
+                <span style="font-size:0.75rem; background:rgba(255,255,255,0.2); padding:3px 8px; border-radius:999px;">ESCキー</span>
+              </div>
+              <div class="modal-body" style="padding: 24px; display: flex; flex-direction: column; gap: 14px;">
+                <div class="choice-stack" style="gap: 12px;">
+                  <button id="btn-menu-settings" class="toy-btn toy-btn-white" style="width:100%; padding: 14px; font-size: 1.05rem; justify-content: flex-start;">
+                    <span style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;">
+                      ${GameIcons.gear({ size: 22 })}
+                      <span>設定（サウンド・音量）</span>
+                    </span>
+                  </button>
+                  <button id="btn-menu-help" class="toy-btn toy-btn-white" style="width:100%; padding: 14px; font-size: 1.05rem; justify-content: flex-start;">
+                    <span style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;">
+                      <span style="font-weight:900;font-size:1.2rem;color:#2563eb;">？</span>
+                      <span>ヘルプ（公式ルール確認）</span>
+                    </span>
+                  </button>
+                  ${
+                    progressionManager.isDevAdmin()
+                      ? `
+                    <button id="btn-menu-dev-console" class="toy-btn toy-btn-gold" style="width:100%; padding: 14px; font-size: 1.05rem; justify-content: flex-start;">
+                      <span style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;">
+                        <span>🛠️</span>
+                        <span>開発者コンソール (Dev Tools)</span>
+                      </span>
+                    </button>
+                  `
+                      : ''
+                  }
+                  <button id="btn-menu-lobby" class="toy-btn toy-btn-white" style="width:100%; padding: 14px; font-size: 1.05rem; justify-content: flex-start; color:#dc2626; border-color:#fca5a5;">
+                    <span style="display:inline-flex;align-items:center;gap:10px;margin-left:8px;">
+                      ${GameIcons.arrowBack({ size: 22 })}
+                      <span>対戦を終了して退出（ロビーへ）</span>
+                    </span>
+                  </button>
+                </div>
+                <div class="modal-footer-btns" style="justify-content: center; margin-top: 10px;">
+                  <button data-close-submodal="true" class="toy-btn toy-btn-blue" style="padding: 12px 36px; font-size: 1.05rem;">
+                    ゲームに戻る
+                  </button>
                 </div>
               </div>
             </div>
@@ -2455,6 +4027,42 @@ export class UIManager {
         this.soundManager.playGlobalSound('ui_cancel');
         this.subModal = 'NONE';
         this.render();
+      });
+    });
+
+    // UIスケール設定
+    const scaleSlider = this.container.querySelector('#input-ui-scale-slider') as HTMLInputElement | null;
+    const scaleValText = this.container.querySelector('#text-ui-scale-val') as HTMLElement | null;
+    scaleSlider?.addEventListener('input', () => {
+      const val = Number(scaleSlider.value);
+      this.setUiScale(val / 100);
+      if (scaleValText) {
+        scaleValText.textContent = `${val}%`;
+      }
+      this.container.querySelectorAll('[data-ui-scale-preset]').forEach((btn) => {
+        const pVal = Math.round(Number(btn.getAttribute('data-ui-scale-preset')) * 100);
+        if (pVal === val) {
+          btn.classList.add('active-scale');
+        } else {
+          btn.classList.remove('active-scale');
+        }
+      });
+    });
+
+    this.container.querySelectorAll('[data-ui-scale-preset]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        const presetVal = Number((e.currentTarget as HTMLElement).getAttribute('data-ui-scale-preset'));
+        this.soundManager.playGlobalSound('ui_click');
+        this.setUiScale(presetVal);
+        if (scaleSlider) {
+          scaleSlider.value = Math.round(presetVal * 100).toString();
+        }
+        if (scaleValText) {
+          scaleValText.textContent = `${Math.round(presetVal * 100)}%`;
+        }
+        this.container.querySelectorAll('[data-ui-scale-preset]').forEach((b) => {
+          b.classList.toggle('active-scale', b === e.currentTarget);
+        });
       });
     });
 
@@ -2495,15 +4103,13 @@ export class UIManager {
       });
     });
 
-    // 銀行売却モーダル
+    // 銀行売却モーダル（物件選択で売却確認ダイアログを開く）
     this.container.querySelectorAll('[data-manual-bank-sell]').forEach((btn) => {
       btn.addEventListener('click', (e) => {
         if (!this.engine) return;
         const tid = Number((e.currentTarget as HTMLElement).getAttribute('data-manual-bank-sell'));
-        const current = this.engine.getCurrentPlayer();
-        this.soundManager.playGlobalSound('buy');
-        this.engine.sellPropertyToBank(current.id, tid, false);
-        this.subModal = 'NONE';
+        this.soundManager.playGlobalSound('ui_click');
+        this.pendingSellTileId = tid;
         this.render();
       });
     });
@@ -2602,6 +4208,11 @@ export class UIManager {
       this.subModal = 'HELP';
       this.render();
     });
+    this.container.querySelector('#btn-menu-dev-console')?.addEventListener('click', () => {
+      this.subModal = 'NONE';
+      this.render();
+      this.devConsole.open();
+    });
     this.container.querySelector('#btn-menu-lobby')?.addEventListener('click', () => {
       this.subModal = 'NONE';
       this.showScreen('LOBBY');
@@ -2627,6 +4238,8 @@ export class UIManager {
         _purpose: 'move' | 'jail' | 'event',
         onFinish: () => void
       ) => {
+        // サイコロを振る際は自コマへカメラをスムーズに戻す
+        this.mainScene.resetCameraToPlayer();
         this.mainScene.rollDice3D(targetValue, onFinish);
       },
       onPlayerStepped: (
@@ -2652,6 +4265,9 @@ export class UIManager {
       onLogAdded: (entry: GameLogEntry) => {
         this.pushToast(entry);
       },
+      onTileReplaced: (tile: BoardTile) => {
+        this.mainScene.refreshSingleTileMesh(tile);
+      },
       onGameOver: (rankings: AssetBreakdown[], awards: SpecialAward[]) => {
         this.showResultScreen(rankings, awards);
       },
@@ -2659,15 +4275,29 @@ export class UIManager {
   }
 
   private startMatchFromLobby(): void {
-    const engine = this.roomManager.startGameEngine(this.createEngineCallbacks());
-
-    this.engine = engine;
-    this.mainScene.buildBoard(engine.tiles);
-    this.mainScene.syncWithEngine(engine);
-    this.currentScreen = 'GAME';
-    this.subModal = 'NONE';
-    engine.startGame();
-    this.render();
+    this.runWithLoadingScreen({
+      title: '🎲 ゲームを開始しています...',
+      steps: [
+        '3D都市マップと全36マスを構築中...',
+        '物件・ランドマークモデルを配置中...',
+        'プレイヤーコマと3D物理ダイスを準備中...',
+      ],
+      minDurationMs: 1200,
+      task: () => {
+        const engine = this.roomManager.startGameEngine(this.createEngineCallbacks());
+        this.engine = engine;
+        this.devConsole.setEngine(engine);
+        this.mainScene.buildBoard(engine.tiles);
+        this.mainScene.syncWithEngine(engine);
+        return true;
+      },
+      onComplete: () => {
+        this.currentScreen = 'GAME';
+        this.subModal = 'NONE';
+        this.engine?.startGame();
+        this.render();
+      },
+    });
   }
 
   // ==========================================

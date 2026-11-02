@@ -31,11 +31,15 @@ import {
   TRADE_RESPONSE_TIME_SEC,
   TURN_TIME_LIMIT_SEC,
   ThemeColorId,
+  TokenSkinId,
+  TOKEN_SKINS,
   UNEMPLOYED_FIRST_ALLOWANCE,
 } from '../config/constants';
 import {
   BoardTile,
   MapGenerator,
+  PropertyType,
+  TileType,
   calculateBankSellValue,
   calculateCommercialRegularIncome,
   calculatePropertyPurchaseCost,
@@ -88,6 +92,7 @@ export interface PlayerState {
   isBankrupt: boolean;
   characterId: CharacterId;
   colorId: ThemeColorId;
+  skinId?: TokenSkinId;
 
   cash: number;
   currentTileId: number;
@@ -164,6 +169,7 @@ export interface AssetBreakdown {
   playerName: string;
   characterId: CharacterId;
   colorId: ThemeColorId;
+  skinId?: TokenSkinId;
   isBankrupt: boolean;
   rank: number;
   cash: number;
@@ -219,6 +225,7 @@ export interface GameEngineCallbacks {
     effectType: 'coin' | 'build' | 'celebrate' | 'alert' | 'auction'
   ) => void;
   onLogAdded?: (entry: GameLogEntry) => void;
+  onTileReplaced?: (tile: BoardTile) => void;
   onGameOver?: (rankings: AssetBreakdown[], awards: SpecialAward[]) => void;
 }
 
@@ -320,6 +327,7 @@ export class GameEngine {
       isHost: boolean;
       characterId: CharacterId;
       colorId: ThemeColorId;
+      skinId?: TokenSkinId;
     }>,
     callbacks: GameEngineCallbacks = {}
   ) {
@@ -339,6 +347,7 @@ export class GameEngine {
       isBankrupt: false,
       characterId: p.characterId,
       colorId: p.colorId,
+      skinId: p.skinId ?? 'standard',
       cash: INITIAL_CASH,
       currentTileId: 0,
       jobId: 'unemployed',
@@ -2987,5 +2996,186 @@ export class GameEngine {
 
   private notifyStateChanged(): void {
     this.callbacks.onStateChanged?.();
+  }
+
+  // ==========================================
+  // 🛠️ 開発者モード・デバッグ用操作メソッド
+  // ==========================================
+
+  public debugSetCash(playerId: string, cash: number): void {
+    const p = this.getPlayerById(playerId);
+    if (!p) return;
+    p.cash = Math.max(0, cash);
+    this.addLog(playerId, `🛠️ [DEV] ${p.name} の所持金を ${p.cash.toLocaleString()}万円 に変更しました`, 'info');
+    this.notifyStateChanged();
+  }
+
+  public debugAddCash(playerId: string, amount: number): void {
+    const p = this.getPlayerById(playerId);
+    if (!p) return;
+    p.cash = Math.max(0, p.cash + amount);
+    this.addLog(
+      playerId,
+      `🛠️ [DEV] ${p.name} の所持金が ${amount > 0 ? '+' : ''}${amount.toLocaleString()}万円 変化しました（現在: ${p.cash.toLocaleString()}万円）`,
+      'info'
+    );
+    this.notifyStateChanged();
+  }
+
+  public debugSetJob(playerId: string, jobId: JobId): void {
+    const p = this.getPlayerById(playerId);
+    if (!p || !(jobId in JOBS)) return;
+    p.jobId = jobId;
+    this.addLog(playerId, `🛠️ [DEV] ${p.name} の職業を「${JOBS[jobId].name}」に変更しました`, 'info');
+    this.notifyStateChanged();
+  }
+
+  public debugSetForcedDice(playerId: string, value: number): void {
+    const p = this.getPlayerById(playerId);
+    if (!p) return;
+    p.forcedNextDice = Math.max(1, Math.min(12, value));
+    this.addLog(
+      playerId,
+      `🛠️ [DEV] ${p.name} の次回サイコロ出目を【${p.forcedNextDice}】に指定しました（イカサマダイス）`,
+      'info'
+    );
+    this.notifyStateChanged();
+  }
+
+  public debugWarpPlayer(playerId: string, targetTileId: number): void {
+    const p = this.getPlayerById(playerId);
+    const tile = this.getTileById(targetTileId);
+    if (!p || !tile) return;
+    p.currentTileId = targetTileId;
+    this.addLog(playerId, `🛠️ [DEV] ${p.name} をマス【${tile.id}: ${tile.name}】へワープさせました`, 'info');
+    this.notifyStateChanged();
+  }
+
+  public debugSetTileOwner(tileId: number, ownerId: string | null): void {
+    const tile = this.getTileById(tileId);
+    if (!tile) return;
+    tile.ownerId = ownerId;
+    if (ownerId && (!tile.level || tile.level < 1)) {
+      tile.level = 1;
+    }
+    const ownerName = ownerId ? this.getPlayerById(ownerId)?.name ?? ownerId : '未所有';
+    this.addLog(
+      ownerId ?? 'system',
+      `🛠️ [DEV] マス【${tile.id}: ${tile.name}】の所有者を「${ownerName}」に変更しました`,
+      'info'
+    );
+    this.notifyStateChanged();
+  }
+
+  public debugSetTileLevel(tileId: number, level: 1 | 2 | 3): void {
+    const tile = this.getTileById(tileId);
+    if (!tile) return;
+    tile.level = level;
+    this.addLog(
+      tile.ownerId ?? 'system',
+      `🛠️ [DEV] マス【${tile.id}: ${tile.name}】の建物を Lv${level}（${level === 3 ? 'ホテル' : level === 2 ? 'ビル' : '住宅'}）に強化しました`,
+      'info'
+    );
+    this.notifyStateChanged();
+  }
+
+  public debugAddAllItems(playerId: string): void {
+    const p = this.getPlayerById(playerId);
+    if (!p) return;
+    const allItemKeys: ItemId[] = [
+      'dice_select',
+      'toll_shield',
+      'discount_ticket',
+      'jail_free',
+      'luxury_watch',
+      'realtor_license',
+      'private_cruiser',
+    ];
+    p.items = [...allItemKeys];
+    this.addLog(playerId, `🛠️ [DEV] ${p.name} に全アイテム（${allItemKeys.length}種）を付与しました`, 'info');
+    this.notifyStateChanged();
+  }
+
+  public debugUpdatePlayerAppearance(
+    playerId: string,
+    charId: CharacterId,
+    colorId: ThemeColorId,
+    skinId: TokenSkinId
+  ): void {
+    const p = this.getPlayerById(playerId);
+    if (!p) return;
+    p.characterId = charId;
+    p.colorId = colorId;
+    p.skinId = skinId;
+    this.addLog(
+      playerId,
+      `🛠️ [DEV] ${p.name} の見た目を更新しました（スキン: ${TOKEN_SKINS[skinId]?.name ?? skinId}）`,
+      'info'
+    );
+    this.notifyStateChanged();
+  }
+
+  public debugReplaceTile(
+    tileId: number,
+    newType: TileType,
+    customName?: string,
+    propertyType: PropertyType = 'residential'
+  ): void {
+    const tile = this.getTileById(tileId);
+    if (!tile) return;
+
+    tile.type = newType;
+    if (customName) {
+      tile.name = customName;
+    }
+
+    if (newType === 'property') {
+      tile.propertyType = propertyType;
+      tile.groupId = tile.groupId || 'G_GREEN';
+      tile.groupName = tile.groupName || 'グリーンヒルズ';
+      tile.groupColor = tile.groupColor || '#22c55e';
+      tile.basePrice = tile.basePrice || 240;
+      if (!tile.level) tile.level = 1;
+    } else {
+      tile.propertyType = undefined;
+      tile.ownerId = null;
+      tile.level = undefined;
+      if (newType === 'start') {
+        tile.name = customName || 'START / 給料日';
+        tile.groupColor = '#22c55e';
+      } else if (newType === 'event') {
+        tile.name = customName || 'チャンスイベント';
+        tile.groupColor = '#f59e0b';
+      } else if (newType === 'career') {
+        tile.name = customName || 'キャリアセンター';
+        tile.groupColor = '#0284c7';
+      } else if (newType === 'family') {
+        tile.name = customName || 'ウェディング＆ファミリー';
+        tile.groupColor = '#ec4899';
+      } else if (newType === 'bonus') {
+        tile.name = customName || '臨時ボーナス';
+        tile.groupColor = '#eab308';
+      } else if (newType === 'shop') {
+        tile.name = customName || 'アイテムショップ';
+        tile.groupColor = '#8b5cf6';
+      } else if (newType === 'tax') {
+        tile.name = customName || '資産税務署';
+        tile.groupColor = '#64748b';
+      } else if (newType === 'jail') {
+        tile.name = customName || '刑務所';
+        tile.groupColor = '#1e293b';
+      } else if (newType === 'branch') {
+        tile.name = customName || 'ルート分岐点';
+        tile.groupColor = '#38bdf8';
+      }
+    }
+
+    this.addLog(
+      'system',
+      `🛠️ [DEV] マス【#${tile.id}】を「${tile.name}（${tile.type}）」へリプレイスしました！`,
+      'info'
+    );
+    this.callbacks.onTileReplaced?.(tile);
+    this.notifyStateChanged();
   }
 }

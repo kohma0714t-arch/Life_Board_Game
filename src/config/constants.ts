@@ -44,9 +44,21 @@ export const TURN_MODE_OPTIONS = [10, 20, 30, 50] as const;
 export const TIME_MODE_OPTIONS_MIN = [15, 30, 45] as const;
 
 // ==========================================
-// 2. キャラクター＆テーマカラー定義
+// 2. 立体コマ（ポーン）＆テーマカラー＆特別スキン定義
 // ==========================================
-export type CharacterId = 'char_1' | 'char_2' | 'char_3' | 'char_4';
+export type CharacterId =
+  | 'char_1'
+  | 'char_2'
+  | 'char_3'
+  | 'char_4'
+  | 'char_5'
+  | 'char_6';
+
+export type TokenSkinId =
+  | 'standard'
+  | 'metallic_gold'
+  | 'crystal_prism'
+  | 'neon_cyber';
 
 export interface CharacterDefinition {
   id: CharacterId;
@@ -55,6 +67,20 @@ export interface CharacterDefinition {
   description: string;
   defaultColorId: ThemeColorId;
   avatarKey: string;
+  iconEmoji: string;
+  unlockCostCoins: number;
+  isInitialUnlocked: boolean;
+}
+
+export interface TokenSkinDefinition {
+  id: TokenSkinId;
+  name: string;
+  subtitle: string;
+  description: string;
+  badgeEmoji: string;
+  unlockCostCoins: number;
+  isInitialUnlocked: boolean;
+  requiresLogin: boolean;
 }
 
 export type ThemeColorId = 'blue' | 'red' | 'green' | 'yellow' | 'purple';
@@ -110,39 +136,118 @@ export const THEME_COLOR_LIST: ThemeColorDefinition[] = Object.values(THEME_COLO
 export const CHARACTERS: Record<CharacterId, CharacterDefinition> = {
   char_1: {
     id: 'char_1',
-    name: 'ハルト',
-    title: '赤パーカーの快活青年',
-    description: 'どんな逆境もポジティブに乗り越える行動派チャレンジャー。',
-    defaultColorId: 'red',
+    name: 'クラシック・ポーン',
+    title: '王道ボードゲームの象徴',
+    description: '手になじむ流線型シルエット。どんな盤面でも安定した存在感を放つ王道立体ピン。',
+    defaultColorId: 'blue',
     avatarKey: 'char_1',
+    iconEmoji: '♟️',
+    unlockCostCoins: 0,
+    isInitialUnlocked: true,
   },
   char_2: {
     id: 'char_2',
-    name: 'ヒナタ',
-    title: '爽やか制服のしっかり者',
-    description: '計画的な貯蓄とキャリアアップで着実に資産を築く優等生。',
-    defaultColorId: 'blue',
+    name: 'GTスポーツカー',
+    title: 'ハイウェイを駆ける疾風',
+    description: '人生ゲームの華！エアロフォルムとリアウイングが輝く流線型スポーツカー立体コマ。',
+    defaultColorId: 'red',
     avatarKey: 'char_2',
+    iconEmoji: '🏎️',
+    unlockCostCoins: 0,
+    isInitialUnlocked: true,
   },
   char_3: {
     id: 'char_3',
-    name: 'ソウタ',
-    title: '知性派メガネのアナリスト',
-    description: '不動産市場と投資のデータを冷徹に分析する頭脳派プレイヤー。',
+    name: 'クラウン・ナイト',
+    title: '知略と誇りの騎士紋章',
+    description: 'チェスの騎士（ナイト）と王冠レリーフを融合した、戦略家にふさわしい気品ある立体コマ。',
     defaultColorId: 'green',
     avatarKey: 'char_3',
+    iconEmoji: '🐴',
+    unlockCostCoins: 0,
+    isInitialUnlocked: true,
   },
   char_4: {
     id: 'char_4',
-    name: 'ユイ',
-    title: '華やかワンピースのヒロイン',
-    description: '華麗な人脈と強運を味方に、人生のビッグチャンスを掴み取る。',
+    name: 'スカイ・ジェット',
+    title: '大空を制するプライベート機',
+    description: '世界中の都市とリゾートを飛び回る、流線型ウィングのプライベートジェット立体コマ。',
     defaultColorId: 'yellow',
     avatarKey: 'char_4',
+    iconEmoji: '✈️',
+    unlockCostCoins: 0,
+    isInitialUnlocked: true,
+  },
+  char_5: {
+    id: 'char_5',
+    name: 'ロイヤル・クルーザー',
+    title: '大海原のラグジュアリー艇',
+    description: '【報酬解放コマ】成功者の証である3デッキ仕様の豪華モーターヨット立体コマ。',
+    defaultColorId: 'purple',
+    avatarKey: 'char_5',
+    iconEmoji: '🛥️',
+    unlockCostCoins: 300,
+    isInitialUnlocked: false,
+  },
+  char_6: {
+    id: 'char_6',
+    name: 'エンペラー・クラウン',
+    title: '覇者の至高王冠モノリス',
+    description: '【報酬解放コマ】盤面の支配者にのみ許された、宝石と黄金の翼が輝く皇帝クラウン立体コマ。',
+    defaultColorId: 'yellow',
+    avatarKey: 'char_6',
+    iconEmoji: '👑',
+    unlockCostCoins: 500,
+    isInitialUnlocked: false,
   },
 };
 
 export const CHARACTER_LIST: CharacterDefinition[] = Object.values(CHARACTERS);
+
+export const TOKEN_SKINS: Record<TokenSkinId, TokenSkinDefinition> = {
+  standard: {
+    id: 'standard',
+    name: 'スタンダード（グロス塗装）',
+    subtitle: '初期装備',
+    description: 'テーマカラーが鮮やかに発色する、ボードゲーム王道の艶ありグロス仕上げ。',
+    badgeEmoji: '🎨',
+    unlockCostCoins: 0,
+    isInitialUnlocked: true,
+    requiresLogin: false,
+  },
+  metallic_gold: {
+    id: 'metallic_gold',
+    name: '純金ゴールド（24K Gold）',
+    subtitle: '要ログイン・報酬解放',
+    description: 'コマ全体が眩い24Kゴールドの金属光沢を放ち、台座に黄金リングが輝く特別スキン。',
+    badgeEmoji: '✨',
+    unlockCostCoins: 250,
+    isInitialUnlocked: false,
+    requiresLogin: true,
+  },
+  crystal_prism: {
+    id: 'crystal_prism',
+    name: 'クリスタル・プリズム',
+    subtitle: '要ログイン・報酬解放',
+    description: '透き通る宝石クリスタル調の光沢とプリズム反射を備えた神秘的な特別スキン。',
+    badgeEmoji: '💎',
+    unlockCostCoins: 350,
+    isInitialUnlocked: false,
+    requiresLogin: true,
+  },
+  neon_cyber: {
+    id: 'neon_cyber',
+    name: 'ネオン・サイバーグロウ',
+    subtitle: '要ログイン・報酬解放',
+    description: '高輝度ネオンエネルギーが脈動し、3Dボード上で鮮烈な発光オーラを放つ特別スキン。',
+    badgeEmoji: '⚡',
+    unlockCostCoins: 400,
+    isInitialUnlocked: false,
+    requiresLogin: true,
+  },
+};
+
+export const TOKEN_SKIN_LIST: TokenSkinDefinition[] = Object.values(TOKEN_SKINS);
 
 // ==========================================
 // 3. 職業定義 (全8職種・仕様書7.1完全準拠)

@@ -11,7 +11,7 @@ import { GameEngine, GameMoveStepEvent, PlayerState } from '../systems/GameEngin
 import { BoardTile } from '../systems/MapGenerator';
 import { PhysicsWorld } from '../systems/PhysicsWorld';
 
-export type CameraMode = 'overview' | 'follow';
+export type CameraMode = 'overview' | 'follow' | 'free';
 
 interface ActiveHopAnimation {
   playerId: string;
@@ -67,6 +67,7 @@ export class MainScene {
   private diceMesh: THREE.Mesh | null = null;
   private activeTurnIndicator: THREE.Group;
   private hoverHighlightRing: THREE.Mesh;
+  private cityDiorama: THREE.Group | null = null;
 
   // アニメーション状態
   private hopAnimation: ActiveHopAnimation | null = null;
@@ -80,12 +81,16 @@ export class MainScene {
   private cameraMode: CameraMode = 'overview';
   private cameraTarget = new THREE.Vector3(0, 0.5, 0);
   private desiredCameraTarget = new THREE.Vector3(0, 0.5, 0);
+  private activePlayerPosition = new THREE.Vector3(0, 0.5, 0);
   private orbitYaw = Math.PI * 0.22; // アイソメトリック斜め俯瞰角（リファレンス画像準拠）
   private orbitPitch = 0.72; // 俯角ラジアン
   private orbitDistance = 36;
-  private isDraggingCamera = false;
+  private isOrbitingCamera = false;
+  private isPanningCamera = false;
+  private activeKeys = new Set<string>();
   private pointerDownPos = { x: 0, y: 0 };
   private lastPointerPos = { x: 0, y: 0 };
+  private onCameraModeChanged: ((mode: CameraMode) => void) | null = null;
 
   // カメラシェイク
   private shakeIntensity = 0;
@@ -122,9 +127,9 @@ export class MainScene {
     this.scene.background = this.createSkyGradientTexture();
     this.scene.fog = new THREE.FogExp2(0xdcf0ff, 0.0065);
 
-    // 3. カメラ初期化
+    // 3. カメラ初期化（添付写真ライクな斜め見下ろしクローズアップ：FOV 32）
     this.camera = new THREE.PerspectiveCamera(
-      40,
+      32,
       window.innerWidth / Math.max(1, window.innerHeight),
       0.5,
       220
@@ -177,8 +182,13 @@ export class MainScene {
 
     // 中央都市ジオラマの配置
     this.environmentGroup.clear();
-    const cityDiorama = this.manifest.createCityCenterDiorama(this.manifest.grassTexture);
-    this.environmentGroup.add(cityDiorama);
+    this.cityDiorama = this.manifest.createCityCenterDiorama(this.manifest.grassTexture);
+    this.environmentGroup.add(this.cityDiorama);
+
+    // 盤面外郭タウン建物群 ＆ サテライトミニ浮島の配置
+    const outerTown = this.manifest.createOuterTownBuildings();
+    const satelliteIslands = this.manifest.createSatelliteIslands();
+    this.environmentGroup.add(outerTown, satelliteIslands);
 
     // ボード外周の爽やかな海・芝生アイランド基礎と浮かぶ雲の装飾
     this.buildSurroundingIslandAndClouds();
@@ -205,15 +215,26 @@ export class MainScene {
     return this.cameraMode;
   }
 
+  public onCameraModeChange(cb: (mode: CameraMode) => void): void {
+    this.onCameraModeChanged = cb;
+  }
+
   public setCameraMode(mode: CameraMode): void {
+    const prev = this.cameraMode;
     this.cameraMode = mode;
     if (mode === 'overview') {
       this.desiredCameraTarget.set(0, 0.4, 0);
-      this.orbitDistance = 36;
+      this.orbitDistance = 34;
       this.orbitPitch = 0.72;
-    } else {
-      this.orbitDistance = 20;
-      this.orbitPitch = 0.62;
+    } else if (mode === 'follow') {
+      this.desiredCameraTarget.copy(this.activePlayerPosition);
+      this.orbitDistance = 15.2;
+      this.orbitPitch = 0.68;
+    } else if (mode === 'free') {
+      // freeモードは現在の目標位置を維持。パンまたは旋回で自由に移動
+    }
+    if (prev !== mode) {
+      this.onCameraModeChanged?.(mode);
     }
   }
 
@@ -223,9 +244,18 @@ export class MainScene {
     return next;
   }
 
+  /**
+   * プレイヤー自身のコマへカメラをスムーズに復帰
+   */
+  public resetCameraToPlayer(): void {
+    this.setCameraMode('follow');
+    this.soundManager.playGlobalSound('ui_click');
+  }
+
   public focusOnTile(tileId: number): void {
     const tileGroup = this.tileMeshes.get(tileId);
     if (!tileGroup) return;
+    this.setCameraMode('free');
     this.desiredCameraTarget.set(tileGroup.position.x, tileGroup.position.y + 0.5, tileGroup.position.z);
   }
 
@@ -241,29 +271,59 @@ export class MainScene {
     this.tileMeshes.clear();
     this.buildingMeshes.clear();
 
-    // ボード全体のグリーンアイランド土台フレーム（外周マスの下敷き）
-    const outerIsland = new THREE.Mesh(
-      new THREE.BoxGeometry(33.2, 0.5, 33.2),
+    // 新世代 3Dトイ・アイランド多層スラブ（Toytopia City 浮島ベース：外郭タウン対応40mワイド設計）
+    // 1. 最下段：ディープスレートの浮遊ベース（影の落ちるアンダーボディ）
+    const bottomBase = new THREE.Mesh(
+      new THREE.BoxGeometry(41.4, 1.4, 41.4),
       new THREE.MeshStandardMaterial({
-        map: this.manifest.grassTexture,
-        color: 0x86efac,
-        roughness: 0.65,
+        color: 0x334155,
+        roughness: 0.6,
+        metalness: 0.1,
       })
     );
-    outerIsland.position.y = -0.26;
-    outerIsland.receiveShadow = true;
-    this.bridgesGroup.add(outerIsland);
+    bottomBase.position.y = -1.05;
+    bottomBase.receiveShadow = true;
+    this.bridgesGroup.add(bottomBase);
 
-    const outerRim = new THREE.Mesh(
-      new THREE.BoxGeometry(34.2, 0.45, 34.2),
+    // 2. 中下段：トイブロック成型カラー層（ラベンダーパープルのベベルブロック）
+    const purpleSlab = new THREE.Mesh(
+      new THREE.BoxGeometry(40.4, 0.75, 40.4),
       new THREE.MeshStandardMaterial({
-        color: 0xf8fafc,
+        color: 0xa855f7,
         roughness: 0.35,
+        metalness: 0.1,
       })
     );
-    outerRim.position.y = -0.35;
+    purpleSlab.position.y = -0.48;
+    purpleSlab.receiveShadow = true;
+    purpleSlab.castShadow = true;
+    this.bridgesGroup.add(purpleSlab);
+
+    // 3. 中上段：純白のチャンキートイフレーム（二重ホワイトベベル）
+    const outerRim = new THREE.Mesh(
+      new THREE.BoxGeometry(39.4, 0.42, 39.4),
+      new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        roughness: 0.2,
+        metalness: 0.05,
+      })
+    );
+    outerRim.position.y = -0.19;
     outerRim.receiveShadow = true;
     this.bridgesGroup.add(outerRim);
+
+    // 4. 上段：みずみずしいエメラルド芝生のフィールド天面
+    const outerIsland = new THREE.Mesh(
+      new THREE.BoxGeometry(38.2, 0.38, 38.2),
+      new THREE.MeshStandardMaterial({
+        map: this.manifest.grassTexture,
+        color: 0x84cc16,
+        roughness: 0.55,
+      })
+    );
+    outerIsland.position.y = 0.0;
+    outerIsland.receiveShadow = true;
+    this.bridgesGroup.add(outerIsland);
 
     // 各マスの立体タイル生成
     for (const tile of tiles) {
@@ -377,14 +437,17 @@ export class MainScene {
 
     // 追従カメラモード時は現在の手番プレイヤーを注視
     const current = engine.getCurrentPlayer();
-    if (current && this.cameraMode === 'follow' && !this.physicsWorld.isRolling() && !this.hopAnimation) {
+    if (current && !this.physicsWorld.isRolling() && !this.hopAnimation) {
       const playerMesh = this.playerMeshes.get(current.id);
       if (playerMesh) {
-        this.desiredCameraTarget.set(
+        this.activePlayerPosition.set(
           playerMesh.position.x,
           playerMesh.position.y + 0.8,
           playerMesh.position.z
         );
+        if (this.cameraMode === 'follow') {
+          this.desiredCameraTarget.copy(this.activePlayerPosition);
+        }
       }
     }
   }
@@ -418,14 +481,15 @@ export class MainScene {
       if (p.isBankrupt) continue;
 
       const colorHex = THEME_COLORS[p.colorId]?.hex ?? '#3b82f6';
+      const skinId = p.skinId ?? 'standard';
       let mesh = this.playerMeshes.get(p.id);
-      const meshKey = `${p.characterId}_${colorHex}`;
+      const meshKey = `${p.characterId}_${colorHex}_${skinId}`;
 
       if (!mesh || mesh.userData.meshKey !== meshKey) {
         if (mesh) {
           this.playersGroup.remove(mesh);
         }
-        mesh = this.manifest.createPlayerMesh(p.characterId, colorHex);
+        mesh = this.manifest.createPlayerMesh(p.characterId, colorHex, skinId);
         mesh.userData.meshKey = meshKey;
         this.playersGroup.add(mesh);
         this.playerMeshes.set(p.id, mesh);
@@ -609,6 +673,83 @@ export class MainScene {
       pos.z += Math.sign(outward.z) * 1.95;
     }
     return pos;
+  }
+
+  /**
+   * 🛠️ 開発者モード用：単一マスの立体メッシュ・建物をリアルタイムに再生成して3D同期
+   */
+  public refreshSingleTileMesh(tile: BoardTile): void {
+    if (!this.manifest) return;
+
+    // 1. 古いタイルメッシュを削除
+    const oldMesh = this.tileMeshes.get(tile.id);
+    if (oldMesh) {
+      this.tilesGroup.remove(oldMesh);
+      oldMesh.traverse((c) => {
+        if (c instanceof THREE.Mesh) {
+          c.geometry?.dispose();
+          if (Array.isArray(c.material)) c.material.forEach((m) => m.dispose());
+          else c.material?.dispose();
+        }
+      });
+      this.tileMeshes.delete(tile.id);
+    }
+
+    // 2. 新しい立体タイルメッシュを生成
+    let subText = '';
+    if (tile.type === 'property' && tile.basePrice) {
+      subText = `${tile.basePrice}万円`;
+    } else if (tile.type === 'start') {
+      subText = '給料日!';
+    } else if (tile.type === 'bonus') {
+      subText = '+300万円';
+    } else if (tile.type === 'tax') {
+      subText = '資産税10%';
+    } else if (tile.type === 'branch') {
+      subText = 'ルート選択';
+    }
+
+    const meshType =
+      tile.type === 'property' && tile.propertyType ? tile.propertyType : tile.type;
+
+    const newTileMesh = this.manifest.createTileMesh({
+      type: meshType,
+      name: tile.name,
+      groupColor: tile.groupColor,
+      subText,
+      isBranch: tile.type === 'branch' || tile.isBranchSubTile,
+    });
+
+    newTileMesh.position.set(tile.position.x, tile.position.y, tile.position.z);
+    newTileMesh.traverse((child) => {
+      child.userData.tileId = tile.id;
+    });
+
+    if (tile.isBranchSubTile && tile.position.y > 0.1) {
+      const pillar = new THREE.Mesh(
+        new THREE.CylinderGeometry(0.32, 0.42, tile.position.y + 0.3, 12),
+        new THREE.MeshStandardMaterial({ color: 0xe2e8f0, roughness: 0.4 })
+      );
+      pillar.position.y = -(tile.position.y / 2);
+      pillar.castShadow = true;
+      pillar.receiveShadow = true;
+      newTileMesh.add(pillar);
+    }
+
+    this.tilesGroup.add(newTileMesh);
+    this.tileMeshes.set(tile.id, newTileMesh);
+
+    // 3. 物件でなくなった場合は既存の建物を撤去
+    const existingBuilding = this.buildingMeshes.get(tile.id);
+    if (existingBuilding && (tile.type !== 'property' || !tile.ownerId)) {
+      this.buildingsGroup.remove(existingBuilding.mesh);
+      this.buildingMeshes.delete(tile.id);
+    }
+
+    // 4. 建て替えエフェクト（パーティクル＆サウンド）
+    const origin = new THREE.Vector3(tile.position.x, tile.position.y + 0.6, tile.position.z);
+    this.spawnCelebrationBurst(origin, tile.groupColor || '#38bdf8', 45);
+    this.soundManager.playGlobalSound('upgrade');
   }
 
   /**
@@ -808,12 +949,14 @@ export class MainScene {
         anim.mesh.position.z
       );
 
+      this.activePlayerPosition.set(
+        anim.mesh.position.x,
+        anim.mesh.position.y + 0.6,
+        anim.mesh.position.z
+      );
+
       if (this.cameraMode === 'follow') {
-        this.desiredCameraTarget.set(
-          anim.mesh.position.x,
-          anim.mesh.position.y + 0.6,
-          anim.mesh.position.z
-        );
+        this.desiredCameraTarget.copy(this.activePlayerPosition);
       }
 
       if (t >= 1) {
@@ -892,9 +1035,110 @@ export class MainScene {
       cloud.position.y += Math.cos(this.elapsedClock * 0.6 + idx) * 0.003;
     });
 
-    // 7. カメラ更新＆描画
+    // 7. 【動的ジオラマ演出】ミニチュアカー走行・風車回転・噴水クリスタル浮遊
+    if (this.cityDiorama && this.cityDiorama.userData.animatedCity) {
+      const anim = this.cityDiorama.userData.animatedCity;
+
+      // 風車の回転
+      if (anim.windmillBlades) {
+        for (const bladeGroup of anim.windmillBlades) {
+          bladeGroup.rotation.z += safeDt * 1.6;
+        }
+      }
+
+      // 噴水グランドクリスタルの浮遊＆回転
+      if (anim.crystal) {
+        anim.crystal.rotation.y += safeDt * 1.2;
+        anim.crystal.position.y = 1.15 + Math.sin(this.elapsedClock * 2.6) * 0.06;
+      }
+
+      // ミニチュアカーの環状道路走行（角丸正方形コース）
+      if (anim.cars) {
+        const half = 6.2;
+        for (const car of anim.cars) {
+          car.progress = (car.progress + safeDt * car.speed * 0.2) % 1.0;
+          const t = car.progress * 4;
+          const seg = Math.floor(t);
+          const frac = t - seg;
+
+          let posX = 0;
+          let posZ = 0;
+          let targetYaw = 0;
+
+          if (seg === 0) {
+            // 南辺（西から東へ）
+            posX = -half + frac * (half * 2);
+            posZ = half;
+            targetYaw = 0;
+          } else if (seg === 1) {
+            // 東辺（南から北へ）
+            posX = half;
+            posZ = half - frac * (half * 2);
+            targetYaw = -Math.PI / 2;
+          } else if (seg === 2) {
+            // 北辺（東から西へ）
+            posX = half - frac * (half * 2);
+            posZ = -half;
+            targetYaw = Math.PI;
+          } else {
+            // 西辺（北から南へ）
+            posX = -half;
+            posZ = -half + frac * (half * 2);
+            targetYaw = Math.PI / 2;
+          }
+
+          car.mesh.position.set(posX, 0.24, posZ);
+          car.mesh.rotation.y = targetYaw;
+        }
+      }
+    }
+
+    // 8. キーボードによるカメラパン移動の反映
+    this.updateKeyboardCameraPan(safeDt);
+
+    // 9. カメラ更新＆描画
     this.updateCameraTransform(safeDt, false);
     this.renderer.render(this.scene, this.camera);
+  }
+
+  /**
+   * キーボード WASD / 矢印キー入力による水平パン移動
+   */
+  private updateKeyboardCameraPan(dt: number): void {
+    if (this.activeKeys.size === 0) return;
+
+    let moveX = 0;
+    let moveZ = 0;
+    if (this.activeKeys.has('KeyW') || this.activeKeys.has('ArrowUp')) moveZ -= 1;
+    if (this.activeKeys.has('KeyS') || this.activeKeys.has('ArrowDown')) moveZ += 1;
+    if (this.activeKeys.has('KeyA') || this.activeKeys.has('ArrowLeft')) moveX -= 1;
+    if (this.activeKeys.has('KeyD') || this.activeKeys.has('ArrowRight')) moveX += 1;
+
+    if (moveX === 0 && moveZ === 0) return;
+
+    if (this.cameraMode !== 'free') {
+      this.setCameraMode('free');
+    }
+
+    const len = Math.hypot(moveX, moveZ);
+    const nx = moveX / len;
+    const nz = moveZ / len;
+
+    // カメラの水平回転角 orbitYaw に基づく Forward & Right 方向ベクトル
+    const sinY = Math.sin(this.orbitYaw);
+    const cosY = Math.cos(this.orbitYaw);
+    const forwardX = -sinY;
+    const forwardZ = -cosY;
+    const rightX = cosY;
+    const rightZ = -sinY;
+
+    // 距離（ズーム）に応じたパン移動速度
+    const panSpeed = (this.orbitDistance * 0.75 + 8) * dt;
+    const deltaX = (rightX * nx - forwardX * nz) * panSpeed;
+    const deltaZ = (rightZ * nx - forwardZ * nz) * panSpeed;
+
+    this.desiredCameraTarget.x = Math.max(-36, Math.min(36, this.desiredCameraTarget.x + deltaX));
+    this.desiredCameraTarget.z = Math.max(-36, Math.min(36, this.desiredCameraTarget.z + deltaZ));
   }
 
   private updateCameraTransform(dt: number, instant = false): void {
@@ -1058,24 +1302,62 @@ export class MainScene {
   }
 
   private setupInteractionEvents(): void {
+    // 右クリックのコンテキストメニューを抑止（パン操作用）
+    this.canvas.addEventListener('contextmenu', (e: MouseEvent) => {
+      e.preventDefault();
+    });
+
     this.canvas.addEventListener('pointerdown', (e: PointerEvent) => {
-      this.isDraggingCamera = true;
+      if (e.button === 2 || (e.button === 0 && e.shiftKey)) {
+        // 右ドラッグまたはShift+左ドラッグで水平パン移動
+        this.isPanningCamera = true;
+      } else if (e.button === 0) {
+        // 左ドラッグで360度オービット旋回
+        this.isOrbitingCamera = true;
+      }
       this.pointerDownPos = { x: e.clientX, y: e.clientY };
       this.lastPointerPos = { x: e.clientX, y: e.clientY };
     });
 
     window.addEventListener('pointermove', (e: PointerEvent) => {
-      if (this.isDraggingCamera) {
+      // 1. 水平パン移動（右ドラッグ / Shift+左ドラッグ）
+      if (this.isPanningCamera) {
+        const dx = e.clientX - this.lastPointerPos.x;
+        const dy = e.clientY - this.lastPointerPos.y;
+        this.lastPointerPos = { x: e.clientX, y: e.clientY };
+
+        if (this.cameraMode !== 'free') {
+          this.setCameraMode('free');
+        }
+
+        const sinY = Math.sin(this.orbitYaw);
+        const cosY = Math.cos(this.orbitYaw);
+        const forwardX = -sinY;
+        const forwardZ = -cosY;
+        const rightX = cosY;
+        const rightZ = -sinY;
+
+        const panFactor = (this.orbitDistance / Math.max(1, window.innerHeight)) * 1.6;
+        const deltaX = (-rightX * dx + forwardX * dy) * panFactor;
+        const deltaZ = (-rightZ * dx + forwardZ * dy) * panFactor;
+
+        this.desiredCameraTarget.x = Math.max(-36, Math.min(36, this.desiredCameraTarget.x + deltaX));
+        this.desiredCameraTarget.z = Math.max(-36, Math.min(36, this.desiredCameraTarget.z + deltaZ));
+        return;
+      }
+
+      // 2. オービット旋回（左ドラッグ）
+      if (this.isOrbitingCamera) {
         const dx = e.clientX - this.lastPointerPos.x;
         const dy = e.clientY - this.lastPointerPos.y;
         this.lastPointerPos = { x: e.clientX, y: e.clientY };
 
         this.orbitYaw -= dx * 0.0065;
-        this.orbitPitch = Math.max(0.32, Math.min(1.28, this.orbitPitch + dy * 0.005));
+        this.orbitPitch = Math.max(0.24, Math.min(1.32, this.orbitPitch + dy * 0.005));
         return;
       }
 
-      // マス目のホバー判定
+      // 3. マス目のホバー判定（ドラッグ操作中でない場合）
       this.updateRaycaster(e.clientX, e.clientY);
       const hitTileId = this.pickTileId();
       if (hitTileId !== this.hoveredTileId) {
@@ -1100,14 +1382,20 @@ export class MainScene {
     });
 
     window.addEventListener('pointerup', (e: PointerEvent) => {
-      if (!this.isDraggingCamera) return;
-      this.isDraggingCamera = false;
+      const wasPanning = this.isPanningCamera;
+      const wasOrbiting = this.isOrbitingCamera;
+      this.isPanningCamera = false;
+      this.isOrbitingCamera = false;
+
+      if (!wasPanning && !wasOrbiting) return;
 
       const moveDist = Math.hypot(
         e.clientX - this.pointerDownPos.x,
         e.clientY - this.pointerDownPos.y
       );
-      if (moveDist < 6) {
+
+      // 左クリックかつドラッグ移動量がごく小さい場合のみマス目クリックと判定
+      if (e.button === 0 && !wasPanning && moveDist < 6) {
         this.updateRaycaster(e.clientX, e.clientY);
         const clickedTileId = this.pickTileId();
         if (clickedTileId !== null) {
@@ -1116,14 +1404,37 @@ export class MainScene {
       }
     });
 
+    // マウスホイールによるズーム（クローズアップ〜全体俯瞰）
     this.canvas.addEventListener(
       'wheel',
       (e: WheelEvent) => {
         e.preventDefault();
-        this.orbitDistance = Math.max(14, Math.min(54, this.orbitDistance + e.deltaY * 0.02));
+        this.orbitDistance = Math.max(10, Math.min(56, this.orbitDistance + e.deltaY * 0.025));
       },
       { passive: false }
     );
+
+    // キーボード操作（WASD/矢印キーでパン移動、Spaceキーで自コマ復帰）
+    window.addEventListener('keydown', (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.isContentEditable)) {
+        return;
+      }
+
+      if (e.code === 'Space') {
+        e.preventDefault();
+        this.resetCameraToPlayer();
+        return;
+      }
+
+      if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight'].includes(e.code)) {
+        this.activeKeys.add(e.code);
+      }
+    });
+
+    window.addEventListener('keyup', (e: KeyboardEvent) => {
+      this.activeKeys.delete(e.code);
+    });
   }
 
   private updateRaycaster(clientX: number, clientY: number): void {
